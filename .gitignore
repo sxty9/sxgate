@@ -1,0 +1,18 @@
+# Cloudflare Tunnel credentials — NEVER commit these
+*credentials*.json
+*.pem
+cert.pem
+.cloudflared/
+cloudflared/config.yml
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

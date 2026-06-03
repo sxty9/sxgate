@@ -1,0 +1,23 @@
+# Cloudflare Tunnel configuration — example / template.
+# Copy to /etc/cloudflared/config.yml on the Ubuntu server and fill in placeholders.
+# Do NOT commit the real config.yml with credentials — .gitignore excludes it.
+
+# Tunnel-ID — vergeben von `cloudflared tunnel create sxgate`.
+tunnel: <TUNNEL_ID>
+
+# Pfad zur Credentials-Datei. `cloudflared tunnel create` legt sie in ~/.cloudflared/<TUNNEL_ID>.json an.
+credentials-file: /root/.cloudflared/<TUNNEL_ID>.json
+
+# Routing: welche eingehende Hostname → welcher lokale Service.
+# Reihenfolge ist wichtig — erste passende Regel gewinnt. Letzter Eintrag MUSS `service: http_status:404` sein (Catch-all).
+ingress:
+  # Beispiel 1: Hauptdomain → Webservice auf Port 8080
+  - hostname: sxgate.<DEINE-DOMAIN>
+    service: http://localhost:8080
+
+  # Beispiel 2: Subdomain für ein anderes Tool (auskommentieren wenn nicht gebraucht)
+  # - hostname: api.<DEINE-DOMAIN>
+  #   service: http://localhost:3000
+
+  # Pflicht: Catch-all am Ende
+  - service: http_status:404
