@@ -12,11 +12,11 @@ credentials-file: /root/.cloudflared/<TUNNEL_ID>.json
 # Reihenfolge ist wichtig — erste passende Regel gewinnt. Letzter Eintrag MUSS `service: http_status:404` sein (Catch-all).
 ingress:
   # Beispiel 1: Hauptdomain → Webservice auf Port 8080
-  - hostname: sxgate.<DEINE-DOMAIN>
+  - hostname: henrysoase.org
     service: http://localhost:8080
 
   # Beispiel 2: Subdomain für ein anderes Tool (auskommentieren wenn nicht gebraucht)
-  # - hostname: api.<DEINE-DOMAIN>
+  # - hostname: api.henrysoase.org
   #   service: http://localhost:3000
 
   # Pflicht: Catch-all am Ende

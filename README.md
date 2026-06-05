@@ -10,7 +10,8 @@ Dieses Repo enthält bewusst **keinen Webservice-Code** — nur die Tunnel-Confi
 
 ## Status
 - [x] Phase A — Repo-Scaffold (Configs als Platzhalter)
-- [ ] Phase B — Domain bei Cloudflare gekauft + Tunnel erstellt
+- [x] Domain: **henrysoase.org** (bei Cloudflare registriert, Zone aktiv)
+- [ ] Phase B — Tunnel auf Server eingerichtet + DNS-Record gesetzt
 - [ ] Phase C — Webservice auf Server läuft + Tunnel zeigt auf den Port
 
 ## Phase B — Sobald die Domain bei Cloudflare steht
@@ -32,7 +33,7 @@ cloudflared tunnel login
 cloudflared tunnel create sxgate
 
 # 4. DNS-Record für deine (Sub-)Domain anlegen
-cloudflared tunnel route dns sxgate sxgate.<DEINE-DOMAIN>
+cloudflared tunnel route dns sxgate henrysoase.org
 
 # 5. Config schreiben — siehe cloudflared/config.yml.example
 sudo cp cloudflared/config.yml.example /etc/cloudflared/config.yml
