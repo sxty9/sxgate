@@ -11,6 +11,7 @@ Dieses Repo enthält bewusst **keinen Webservice-Code** — nur die Tunnel-Confi
 ## Status
 - [x] Phase A — Repo-Scaffold (Configs als Platzhalter)
 - [x] Domain: **henrysoase.org** (bei Cloudflare registriert, Zone aktiv)
+- [x] CLI: `sxgate` für Subdomain↔Service-Verwaltung (siehe [docs/cli.md](docs/cli.md))
 - [ ] Phase B — Tunnel auf Server eingerichtet + DNS-Record gesetzt
 - [ ] Phase C — Webservice auf Server läuft + Tunnel zeigt auf den Port
 
@@ -32,14 +33,11 @@ cloudflared tunnel login
 # 3. Tunnel anlegen — liefert eine Tunnel-ID + Credentials-JSON in ~/.cloudflared/
 cloudflared tunnel create sxgate
 
-# 4. DNS-Record für deine (Sub-)Domain anlegen
-cloudflared tunnel route dns sxgate henrysoase.org
+# 4. sxgate installieren — übernimmt ab hier die config.yml und DNS-Records
+sudo ./install.sh
+sudo sxgate init --zone henrysoase.org
 
-# 5. Config schreiben — siehe cloudflared/config.yml.example
-sudo cp cloudflared/config.yml.example /etc/cloudflared/config.yml
-sudo nano /etc/cloudflared/config.yml   # Platzhalter ausfüllen
-
-# 6. Als systemd-Service installieren (startet bei Boot)
+# 5. Als systemd-Service installieren (startet bei Boot)
 sudo cloudflared service install
 sudo systemctl status cloudflared
 ```
@@ -47,12 +45,40 @@ sudo systemctl status cloudflared
 **Wichtig:** Die `~/.cloudflared/<TUNNEL-ID>.json` enthält Credentials — **niemals committen**. `.gitignore` deckt das ab.
 
 ## Phase C — Webservice anbinden
-In `/etc/cloudflared/config.yml` den `ingress`-Block auf den lokalen Port des Webservices zeigen lassen (z.B. `http://localhost:8080`). Dann `sudo systemctl restart cloudflared`.
+Mit dem `sxgate` CLI:
+
+```bash
+sudo sxgate service add blog http://localhost:2368
+sudo sxgate route   add blog.henrysoase.org blog
+sudo sxgate route   ls
+```
+
+Das CLI legt den DNS-Record an (`cloudflared tunnel route dns …`), schreibt die Ingress-Regel atomisch in `/etc/cloudflared/config.yml` und reloaded den Tunnel. Details: [docs/cli.md](docs/cli.md).
 
 ## Troubleshooting
 - `cloudflared tunnel list` — zeigt aktive Tunnels
 - `journalctl -u cloudflared -f` — Live-Logs
 - `cloudflared tunnel info sxgate` — Verbindungs-Status
+
+## CLI
+
+`sxgate` managt Subdomain↔Service-Mappings zentral. Konzept: **Services** sind benannte Targets (Name → URL), **Routes** binden Hostnames an Services. Die Live-Config bleibt `/etc/cloudflared/config.yml` — `sxgate` editiert sie direkt mit Backups + Validierung + Rollback.
+
+```bash
+sudo sxgate init --zone henrysoase.org      # einmalig
+sudo sxgate service add blog http://localhost:2368
+sudo sxgate route   add blog.henrysoase.org blog
+sudo sxgate route   ls
+sudo sxgate status
+```
+
+Tests laufen offline (mocken `cloudflared` und `systemctl`):
+
+```bash
+bash tests/run.sh
+```
+
+Vollständige Referenz: [docs/cli.md](docs/cli.md).
 
 ## Mehr
 Siehe [docs/architecture.md](docs/architecture.md) für Glossar und Konzepte (DNS, Tunnel, Reverse Proxy, CGNAT).

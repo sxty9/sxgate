@@ -1,0 +1,718 @@
+#!/usr/bin/env bash
+# sxgate — manage subdomain↔service routing for a Cloudflare Tunnel.
+# Single-file bash CLI; runs on stock Ubuntu (no extra deps beyond cloudflared + coreutils).
+
+set -euo pipefail
+
+SXGATE_VERSION="0.1.0"
+
+: "${SXGATE_CONF:=/etc/sxgate/sxgate.conf}"
+: "${SERVICES_FILE:=/etc/sxgate/services}"
+: "${BACKUP_DIR:=/etc/sxgate/backups}"
+: "${CONFIG_FILE:=/etc/cloudflared/config.yml}"
+: "${LOCK_FILE:=/var/lock/sxgate.lock}"
+: "${BACKUP_KEEP:=5}"
+: "${TUNNEL_NAME:=sxgate}"
+: "${MANAGED_ZONE:=}"
+: "${SXGATE_YES:=0}"
+: "${SXGATE_QUIET:=0}"
+: "${SXGATE_DEBUG:=0}"
+
+[ "$SXGATE_DEBUG" = "1" ] && set -x
+
+# ── output ────────────────────────────────────────────────────────────────────
+log()  { [ "$SXGATE_QUIET" = "1" ] || printf '%s\n' "$*"; }
+warn() { printf 'sxgate: warning: %s\n' "$*" >&2; }
+die()  { printf 'sxgate: error: %s\n' "$*" >&2; exit "${2:-1}"; }
+trap 'rc=$?; [ $rc -ne 0 ] && [ "$SXGATE_QUIET" != "1" ] && printf "sxgate: aborted at line %s (exit %s)\n" "$LINENO" "$rc" >&2; exit $rc' ERR
+
+confirm() {
+  [ "$SXGATE_YES" = "1" ] && return 0
+  local prompt=$1 reply
+  printf '%s [y/N] ' "$prompt" >&2
+  read -r reply || return 1
+  [[ "$reply" =~ ^[yY]$ ]]
+}
+
+# ── privilege ─────────────────────────────────────────────────────────────────
+needs_root() {
+  [ "$(id -u)" -eq 0 ] && return 0
+  [ "${SXGATE_NO_SUDO:-0}" = "1" ] && return 0
+  exec sudo -E "$0" "$@"
+}
+
+# ── conf loading ──────────────────────────────────────────────────────────────
+load_conf() {
+  if [ -r "$SXGATE_CONF" ]; then
+    # shellcheck disable=SC1090
+    . "$SXGATE_CONF"
+  fi
+}
+
+# ── locking ───────────────────────────────────────────────────────────────────
+with_lock() {
+  # Reentrant: if SXGATE_LOCKED=1 we already hold it.
+  if [ "${SXGATE_LOCKED:-0}" = "1" ]; then
+    "$@"
+    return
+  fi
+  if ! command -v flock >/dev/null 2>&1; then
+    # flock missing (e.g. macOS dev box) — proceed without locking.
+    SXGATE_LOCKED=1 "$@"
+    return
+  fi
+  mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+  exec 9>"$LOCK_FILE"
+  flock -x 9
+  SXGATE_LOCKED=1 "$@"
+}
+
+# ── atomic file ops ───────────────────────────────────────────────────────────
+atomic_write() {
+  # Reads stdin, writes atomically to $1.
+  local dest=$1 tmp
+  mkdir -p "$(dirname "$dest")"
+  tmp=$(mktemp "${dest}.tmp.XXXXXX")
+  cat > "$tmp"
+  if [ -e "$dest" ]; then
+    chmod --reference="$dest" "$tmp" 2>/dev/null || chmod 0644 "$tmp"
+  else
+    chmod 0644 "$tmp"
+  fi
+  sync "$tmp" 2>/dev/null || sync || true
+  mv -f "$tmp" "$dest"
+}
+
+backup_config() {
+  [ -e "$CONFIG_FILE" ] || return 0
+  mkdir -p "$BACKUP_DIR"
+  local ts; ts=$(date -u +%Y%m%dT%H%M%SZ)
+  local target="$BACKUP_DIR/config.yml.$ts"
+  cp -a "$CONFIG_FILE" "$target"
+  # Rotate: keep newest $BACKUP_KEEP
+  # shellcheck disable=SC2012
+  ls -1t "$BACKUP_DIR"/config.yml.* 2>/dev/null \
+    | tail -n +$((BACKUP_KEEP + 1)) \
+    | xargs -r rm -f
+  printf '%s' "$target"
+}
+
+restore_backup() {
+  local newest
+  newest=$(ls -1t "$BACKUP_DIR"/config.yml.* 2>/dev/null | head -n1 || true)
+  [ -n "$newest" ] || die "no backup available to restore" 5
+  cp -a "$newest" "$CONFIG_FILE"
+  warn "restored $CONFIG_FILE from $newest"
+}
+
+# ── validation ────────────────────────────────────────────────────────────────
+validate_service_name() {
+  [[ "$1" =~ ^[a-z][a-z0-9-]{0,30}$ ]] \
+    || die "invalid service name '$1' (must match ^[a-z][a-z0-9-]{0,30}$)" 3
+}
+
+validate_service_url() {
+  [[ "$1" =~ ^https?://[^[:space:]]+$ || "$1" =~ ^http_status:[0-9]{3}$ ]] \
+    || die "invalid service URL '$1' (expected http(s)://… or http_status:NNN)" 3
+}
+
+validate_hostname() {
+  local h=$1
+  [[ "$h" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]] \
+    || die "invalid hostname '$h'" 3
+  [ -n "$MANAGED_ZONE" ] || die "MANAGED_ZONE not set — run 'sxgate init --zone <domain>' first" 5
+  if [ "$h" != "$MANAGED_ZONE" ] && [[ "$h" != *".$MANAGED_ZONE" ]]; then
+    die "hostname '$h' is outside managed zone '$MANAGED_ZONE'" 3
+  fi
+}
+
+# ── services state file ───────────────────────────────────────────────────────
+svc_get() {
+  # Print URL for service $1, or empty.
+  [ -e "$SERVICES_FILE" ] || return 0
+  awk -F= -v n="$1" '$1==n{ sub(/^[^=]*=/, ""); print; exit }' "$SERVICES_FILE"
+}
+
+svc_set() {
+  local name=$1 url=$2 tmp
+  mkdir -p "$(dirname "$SERVICES_FILE")"
+  : > "${SERVICES_FILE}.tmp"
+  if [ -e "$SERVICES_FILE" ]; then
+    awk -F= -v n="$name" '$1!=n' "$SERVICES_FILE" > "${SERVICES_FILE}.tmp"
+  fi
+  printf '%s=%s\n' "$name" "$url" >> "${SERVICES_FILE}.tmp"
+  atomic_write "$SERVICES_FILE" < "${SERVICES_FILE}.tmp"
+  rm -f "${SERVICES_FILE}.tmp"
+}
+
+svc_rm() {
+  local name=$1
+  [ -e "$SERVICES_FILE" ] || return 0
+  awk -F= -v n="$name" '$1!=n' "$SERVICES_FILE" | atomic_write "$SERVICES_FILE"
+}
+
+svc_list_pairs() {
+  # Emit "name<TAB>url" pairs, ignoring blank/comment lines.
+  [ -e "$SERVICES_FILE" ] || return 0
+  awk -F= '
+    /^[[:space:]]*#/ || NF<2 { next }
+    { name=$1; sub(/^[^=]*=/, ""); printf "%s\t%s\n", name, $0 }
+  ' "$SERVICES_FILE"
+}
+
+svc_by_url() {
+  # Reverse lookup: print service name for URL $1, or empty.
+  local url=$1
+  svc_list_pairs | awk -F'\t' -v u="$url" '$2==u{print $1; exit}'
+}
+
+# ── config.yml parsing/emitting ───────────────────────────────────────────────
+# The schema is fixed:
+#   tunnel: <id>
+#   credentials-file: <path>
+#   ingress:
+#     - hostname: H
+#       service: U
+#     ...
+#     - service: http_status:404
+#
+# yaml_split DEST_DIR < CONFIG_FILE
+#   writes:  $DEST_DIR/preamble (header before "ingress:")
+#            $DEST_DIR/tuples   (TSV: hostname<TAB>service)
+#            $DEST_DIR/catchall (the catch-all service string, e.g. "http_status:404")
+yaml_split() {
+  local dir=$1
+  : > "$dir/preamble"
+  : > "$dir/tuples"
+  : > "$dir/catchall"
+  awk -v preamble="$dir/preamble" -v tuples="$dir/tuples" -v catchall="$dir/catchall" '
+    BEGIN { mode="preamble"; have_catchall=0; cur_host=""; }
+    mode=="preamble" {
+      if ($0 ~ /^ingress:[[:space:]]*$/) { mode="ingress"; next }
+      print > preamble
+      next
+    }
+    mode=="ingress" {
+      line=$0
+      sub(/[[:space:]]+#.*$/, "", line)        # strip trailing comments
+      if (line ~ /^[[:space:]]*$/) next        # blank
+      if (match(line, /^[[:space:]]*-[[:space:]]+hostname:[[:space:]]*/)) {
+        cur_host=substr(line, RSTART+RLENGTH)
+        sub(/[[:space:]]+$/, "", cur_host)
+        next
+      }
+      if (match(line, /^[[:space:]]*-?[[:space:]]*service:[[:space:]]*/)) {
+        svc=substr(line, RSTART+RLENGTH)
+        sub(/[[:space:]]+$/, "", svc)
+        if (cur_host != "") {
+          print cur_host "\t" svc > tuples
+          cur_host=""
+        } else {
+          print svc > catchall
+          have_catchall=1
+        }
+        next
+      }
+    }
+    END { if (!have_catchall) exit 5 }
+  ' || die "config.yml malformed — catch-all rule missing or schema not understood" 5
+}
+
+yaml_emit() {
+  # $1 = dir containing preamble, tuples, catchall
+  local dir=$1
+  cat "$dir/preamble"
+  printf 'ingress:\n'
+  if [ -s "$dir/tuples" ]; then
+    while IFS=$'\t' read -r host svc; do
+      [ -z "$host" ] && continue
+      printf '  - hostname: %s\n    service: %s\n' "$host" "$svc"
+    done < "$dir/tuples"
+  fi
+  printf '  - service: %s\n' "$(cat "$dir/catchall")"
+}
+
+# ── route operations (use config.yml as source of truth) ──────────────────────
+route_list_tuples() {
+  # Emit TSV: hostname<TAB>service-url
+  [ -e "$CONFIG_FILE" ] || return 0
+  local d; d=$(mktemp -d)
+  yaml_split "$d" < "$CONFIG_FILE"
+  cat "$d/tuples"
+  rm -rf "$d"
+}
+
+route_upsert() {
+  local host=$1 url=$2
+  [ -e "$CONFIG_FILE" ] || die "config not initialized — run 'sxgate init' first" 5
+  local d; d=$(mktemp -d)
+  yaml_split "$d" < "$CONFIG_FILE"
+  # Drop existing entry for host, then append.
+  local newtuples="$d/tuples.new"
+  awk -F'\t' -v h="$host" '$1!=h' "$d/tuples" > "$newtuples"
+  printf '%s\t%s\n' "$host" "$url" >> "$newtuples"
+  mv -f "$newtuples" "$d/tuples"
+  local backup; backup=$(backup_config || true)
+  yaml_emit "$d" | atomic_write "$CONFIG_FILE"
+  rm -rf "$d"
+  # Validate; rollback on failure
+  if ! cloudflared tunnel ingress validate "$CONFIG_FILE" >/dev/null 2>&1; then
+    if [ -n "${backup:-}" ]; then
+      cp -a "$backup" "$CONFIG_FILE"
+      die "cloudflared rejected the new config; rolled back" 4
+    fi
+    die "cloudflared rejected the new config (no backup to roll back to)" 4
+  fi
+}
+
+route_remove() {
+  local host=$1
+  [ -e "$CONFIG_FILE" ] || die "config not initialized" 5
+  local d; d=$(mktemp -d)
+  yaml_split "$d" < "$CONFIG_FILE"
+  # Check it exists
+  if ! awk -F'\t' -v h="$host" '$1==h{found=1} END{exit !found}' "$d/tuples"; then
+    rm -rf "$d"
+    die "route '$host' not found" 3
+  fi
+  local newtuples="$d/tuples.new"
+  awk -F'\t' -v h="$host" '$1!=h' "$d/tuples" > "$newtuples"
+  mv -f "$newtuples" "$d/tuples"
+  local backup; backup=$(backup_config || true)
+  yaml_emit "$d" | atomic_write "$CONFIG_FILE"
+  rm -rf "$d"
+  if ! cloudflared tunnel ingress validate "$CONFIG_FILE" >/dev/null 2>&1; then
+    if [ -n "${backup:-}" ]; then
+      cp -a "$backup" "$CONFIG_FILE"
+      die "cloudflared rejected the new config; rolled back" 4
+    fi
+    die "cloudflared rejected the new config" 4
+  fi
+}
+
+# ── tunnel ops ────────────────────────────────────────────────────────────────
+get_tunnel_id() {
+  # Look up tunnel ID by name via `cloudflared tunnel list --output json`.
+  local out
+  out=$(cloudflared tunnel list --output json 2>/dev/null) || return 1
+  printf '%s' "$out" | awk -v RS='}' -v name="$TUNNEL_NAME" '
+    $0 ~ "\"name\":\""name"\"" {
+      if (match($0, /"id":"[^"]+"/)) {
+        id=substr($0, RSTART+6, RLENGTH-7)
+        print id; exit
+      }
+    }
+  '
+}
+
+reload_cloudflared() {
+  local mode=${1:-reload}
+  if ! cloudflared tunnel ingress validate "$CONFIG_FILE" >/dev/null 2>&1; then
+    die "config.yml is invalid; refusing to reload" 4
+  fi
+  if [ "$mode" = "restart" ]; then
+    systemctl restart cloudflared
+  else
+    systemctl reload cloudflared 2>/dev/null || systemctl restart cloudflared
+  fi
+}
+
+dns_route() {
+  local host=$1
+  cloudflared tunnel route dns "$TUNNEL_NAME" "$host"
+}
+
+# ── commands ──────────────────────────────────────────────────────────────────
+cmd_init() {
+  local zone="" tunnel="$TUNNEL_NAME" config="$CONFIG_FILE"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --zone)   zone=$2; shift 2 ;;
+      --tunnel) tunnel=$2; shift 2 ;;
+      --config) config=$2; shift 2 ;;
+      -h|--help) cat <<EOF; return 0 ;;
+Usage: sxgate init [--zone <domain>] [--tunnel <name>] [--config <path>]
+
+Initializes sxgate state:
+  * detects the tunnel ID from \`cloudflared tunnel list\`
+  * scaffolds /etc/cloudflared/config.yml if absent (preserves it if present)
+  * writes /etc/sxgate/sxgate.conf and touches /etc/sxgate/services
+EOF
+      *) die "unknown flag: $1" 2 ;;
+    esac
+  done
+  needs_root "init" \
+    "${zone:+--zone}" "${zone:+$zone}" \
+    "${tunnel:+--tunnel}" "${tunnel:+$tunnel}" \
+    "${config:+--config}" "${config:+$config}"
+
+  TUNNEL_NAME=$tunnel
+  CONFIG_FILE=$config
+
+  local tid; tid=$(get_tunnel_id || true)
+  if [ -z "$tid" ]; then
+    die "tunnel '$TUNNEL_NAME' not found. Create it first:\n  cloudflared tunnel create $TUNNEL_NAME" 4
+  fi
+  log "found tunnel: $TUNNEL_NAME ($tid)"
+
+  local creds=""
+  for cand in "/root/.cloudflared/$tid.json" "$HOME/.cloudflared/$tid.json"; do
+    [ -f "$cand" ] && { creds=$cand; break; }
+  done
+  [ -n "$creds" ] || creds="/root/.cloudflared/$tid.json"
+
+  mkdir -p "$(dirname "$SXGATE_CONF")" "$(dirname "$SERVICES_FILE")" "$BACKUP_DIR" "$(dirname "$CONFIG_FILE")"
+
+  # Zone: flag wins; else keep existing; else require it.
+  if [ -z "$zone" ] && [ -r "$SXGATE_CONF" ]; then
+    # shellcheck disable=SC1090
+    . "$SXGATE_CONF"
+    zone=$MANAGED_ZONE
+  fi
+  if [ -z "$zone" ] && [ -e "$CONFIG_FILE" ]; then
+    # Try to infer from existing hostnames.
+    local d; d=$(mktemp -d)
+    if yaml_split "$d" < "$CONFIG_FILE" 2>/dev/null && [ -s "$d/tuples" ]; then
+      # longest common suffix on dot-separated tokens — for now, just take the most-deeply-nested
+      # registrable suffix (last two labels of the first hostname).
+      zone=$(awk -F'\t' 'NR==1{
+        n=split($1, a, ".");
+        if (n>=2) print a[n-1] "." a[n]; else print $1
+      }' "$d/tuples")
+    fi
+    rm -rf "$d"
+  fi
+  [ -n "$zone" ] || die "--zone <domain> is required on first init" 2
+
+  cat > "${SXGATE_CONF}.tmp.$$" <<EOF
+# /etc/sxgate/sxgate.conf — managed by sxgate; safe to edit
+TUNNEL_NAME=$TUNNEL_NAME
+MANAGED_ZONE=$zone
+CONFIG_FILE=$CONFIG_FILE
+EOF
+  atomic_write "$SXGATE_CONF" < "${SXGATE_CONF}.tmp.$$"
+  rm -f "${SXGATE_CONF}.tmp.$$"
+  log "wrote $SXGATE_CONF (zone=$zone)"
+
+  [ -e "$SERVICES_FILE" ] || { : > "$SERVICES_FILE"; chmod 0644 "$SERVICES_FILE"; log "created $SERVICES_FILE"; }
+
+  if [ -e "$CONFIG_FILE" ]; then
+    backup_config >/dev/null
+    log "existing $CONFIG_FILE preserved (backup taken)"
+  else
+    cat > "${CONFIG_FILE}.tmp.$$" <<EOF
+tunnel: $tid
+credentials-file: $creds
+ingress:
+  - service: http_status:404
+EOF
+    atomic_write "$CONFIG_FILE" < "${CONFIG_FILE}.tmp.$$"
+    rm -f "${CONFIG_FILE}.tmp.$$"
+    log "scaffolded $CONFIG_FILE"
+  fi
+
+  cloudflared tunnel ingress validate "$CONFIG_FILE" >/dev/null 2>&1 \
+    || warn "cloudflared could not validate the config — review $CONFIG_FILE"
+
+  log ""
+  log "next steps:"
+  log "  sxgate service add <name> <url>"
+  log "  sxgate route add <host>.$zone <name>"
+}
+
+cmd_service() {
+  local sub=${1:-}
+  shift || true
+  case "$sub" in
+    add) cmd_service_add "$@" ;;
+    ls|list) cmd_service_ls "$@" ;;
+    rm|remove|delete) cmd_service_rm "$@" ;;
+    ""|-h|--help) cat <<EOF ;;
+Usage:
+  sxgate service add <name> <url>
+  sxgate service ls
+  sxgate service rm <name> [--force]
+EOF
+    *) die "unknown subcommand: service $sub" 2 ;;
+  esac
+}
+
+cmd_service_add() {
+  local name=${1:-} url=${2:-}
+  [ -n "$name" ] && [ -n "$url" ] || die "usage: sxgate service add <name> <url>" 2
+  validate_service_name "$name"
+  validate_service_url "$url"
+  needs_root "service" "add" "$name" "$url"
+  load_conf
+  with_lock _svc_add_locked "$name" "$url"
+}
+_svc_add_locked() {
+  local name=$1 url=$2
+  local existing; existing=$(svc_get "$name")
+  if [ -n "$existing" ]; then
+    if [ "$existing" = "$url" ]; then
+      log "service '$name' already registered with $url (no-op)"
+      return 0
+    fi
+    confirm "service '$name' currently → $existing. Update to $url?" \
+      || die "aborted" 10
+    # Check whether any existing route references the old URL → warn.
+    if [ -e "$CONFIG_FILE" ]; then
+      local affected
+      affected=$(route_list_tuples | awk -F'\t' -v u="$existing" '$2==u{print $1}' || true)
+      if [ -n "$affected" ]; then
+        warn "the following routes still point at the OLD URL and will not auto-update:"
+        printf '  %s\n' $affected >&2
+        warn "rerun 'sxgate route add <host> $name' for each to update the live config."
+      fi
+    fi
+  fi
+  svc_set "$name" "$url"
+  log "service '$name' → $url"
+}
+
+cmd_service_ls() {
+  load_conf
+  if [ ! -s "$SERVICES_FILE" ]; then
+    log "(no services registered)"
+    return 0
+  fi
+  printf '%-20s %s\n' NAME URL
+  svc_list_pairs | awk -F'\t' '{printf "%-20s %s\n", $1, $2}'
+}
+
+cmd_service_rm() {
+  local name=${1:-} force=0
+  [ -n "$name" ] || die "usage: sxgate service rm <name> [--force]" 2
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force|-f) force=1; shift ;;
+      *) die "unknown flag: $1" 2 ;;
+    esac
+  done
+  validate_service_name "$name"
+  needs_root "service" "rm" "$name" $([ $force -eq 1 ] && printf -- '--force')
+  load_conf
+  with_lock _svc_rm_locked "$name" "$force"
+}
+_svc_rm_locked() {
+  local name=$1 force=$2
+  local url; url=$(svc_get "$name")
+  [ -n "$url" ] || die "service '$name' not found" 3
+  if [ -e "$CONFIG_FILE" ]; then
+    local affected
+    affected=$(route_list_tuples | awk -F'\t' -v u="$url" '$2==u{print $1}' || true)
+    if [ -n "$affected" ]; then
+      if [ "$force" != "1" ]; then
+        warn "service '$name' is still referenced by routes:"
+        printf '  %s\n' $affected >&2
+        die "refuse to remove. Use --force to remove anyway (routes will keep working with the URL inlined)." 3
+      fi
+    fi
+  fi
+  svc_rm "$name"
+  log "service '$name' removed"
+}
+
+cmd_route() {
+  local sub=${1:-}
+  shift || true
+  case "$sub" in
+    add) cmd_route_add "$@" ;;
+    ls|list) cmd_route_ls "$@" ;;
+    rm|remove|delete) cmd_route_rm "$@" ;;
+    ""|-h|--help) cat <<EOF ;;
+Usage:
+  sxgate route add <hostname> <service-name> [--no-dns] [--no-reload]
+  sxgate route ls
+  sxgate route rm <hostname> [--purge-dns] [--no-reload] [--yes]
+EOF
+    *) die "unknown subcommand: route $sub" 2 ;;
+  esac
+}
+
+cmd_route_add() {
+  local host=${1:-} svcname=${2:-} no_dns=0 no_reload=0
+  [ -n "$host" ] && [ -n "$svcname" ] || die "usage: sxgate route add <hostname> <service-name>" 2
+  shift 2 || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-dns) no_dns=1; shift ;;
+      --no-reload) no_reload=1; shift ;;
+      *) die "unknown flag: $1" 2 ;;
+    esac
+  done
+  validate_service_name "$svcname"
+  needs_root "route" "add" "$host" "$svcname" \
+    $([ $no_dns -eq 1 ] && printf -- '--no-dns') \
+    $([ $no_reload -eq 1 ] && printf -- '--no-reload')
+  load_conf
+  validate_hostname "$host"
+  local url; url=$(svc_get "$svcname")
+  [ -n "$url" ] || die "service '$svcname' not registered. Run: sxgate service add $svcname <url>" 3
+  with_lock _route_add_locked "$host" "$url" "$svcname" "$no_dns" "$no_reload"
+}
+_route_add_locked() {
+  local host=$1 url=$2 svcname=$3 no_dns=$4 no_reload=$5
+  route_upsert "$host" "$url"
+  log "ingress: $host → $svcname ($url)"
+  if [ "$no_dns" != "1" ]; then
+    if dns_route "$host"; then
+      log "dns: ok"
+    else
+      warn "dns route failed for $host — check 'cloudflared tunnel route dns $TUNNEL_NAME $host' manually"
+    fi
+  fi
+  if [ "$no_reload" != "1" ]; then
+    reload_cloudflared reload
+    log "cloudflared: reloaded"
+  fi
+}
+
+cmd_route_ls() {
+  load_conf
+  if [ ! -e "$CONFIG_FILE" ]; then
+    log "(no config; run sxgate init)"
+    return 0
+  fi
+  printf '%-40s %-15s %s\n' HOSTNAME SERVICE URL
+  local tmp; tmp=$(mktemp)
+  route_list_tuples > "$tmp"
+  if [ ! -s "$tmp" ]; then
+    log "(no routes)"
+    rm -f "$tmp"
+    return 0
+  fi
+  while IFS=$'\t' read -r host url; do
+    local name; name=$(svc_by_url "$url")
+    [ -n "$name" ] || name='?'
+    printf '%-40s %-15s %s\n' "$host" "$name" "$url"
+  done < "$tmp"
+  rm -f "$tmp"
+}
+
+cmd_route_rm() {
+  local host=${1:-} purge_dns=0 no_reload=0
+  [ -n "$host" ] || die "usage: sxgate route rm <hostname>" 2
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --purge-dns) purge_dns=1; shift ;;
+      --no-reload) no_reload=1; shift ;;
+      --yes|-y) SXGATE_YES=1; shift ;;
+      *) die "unknown flag: $1" 2 ;;
+    esac
+  done
+  needs_root "route" "rm" "$host" \
+    $([ $purge_dns -eq 1 ] && printf -- '--purge-dns') \
+    $([ $no_reload -eq 1 ] && printf -- '--no-reload')
+  load_conf
+  confirm "remove route '$host'?" || die "aborted" 10
+  with_lock _route_rm_locked "$host" "$purge_dns" "$no_reload"
+}
+_route_rm_locked() {
+  local host=$1 purge_dns=$2 no_reload=$3
+  route_remove "$host"
+  log "removed route: $host"
+  if [ "$purge_dns" = "1" ]; then
+    warn "cloudflared does not support deleting DNS records via the CLI."
+    warn "delete the record manually at https://dash.cloudflare.com/ → DNS."
+  else
+    log "note: the DNS record for $host is left in place. Delete via Cloudflare dashboard if no longer needed."
+  fi
+  if [ "$no_reload" != "1" ]; then
+    reload_cloudflared reload
+    log "cloudflared: reloaded"
+  fi
+}
+
+cmd_apply() {
+  local mode=reload
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --restart) mode=restart; shift ;;
+      -h|--help) cat <<EOF; return 0 ;;
+Usage: sxgate apply [--restart]
+
+Validates $CONFIG_FILE and reloads cloudflared. Use --restart for a hard restart.
+EOF
+      *) die "unknown flag: $1" 2 ;;
+    esac
+  done
+  needs_root "apply" $([ "$mode" = "restart" ] && printf -- '--restart')
+  load_conf
+  reload_cloudflared "$mode"
+  log "cloudflared: ${mode}ed"
+}
+
+cmd_status() {
+  load_conf
+  echo "── sxgate ──"
+  echo "version:    $SXGATE_VERSION"
+  echo "tunnel:     $TUNNEL_NAME"
+  echo "zone:       ${MANAGED_ZONE:-(unset)}"
+  echo "config:     $CONFIG_FILE"
+  echo "services:   $SERVICES_FILE ($([ -s "$SERVICES_FILE" ] && wc -l < "$SERVICES_FILE" | tr -d ' ' || echo 0) entries)"
+  echo
+  if command -v cloudflared >/dev/null 2>&1; then
+    echo "── cloudflared tunnel info $TUNNEL_NAME ──"
+    cloudflared tunnel info "$TUNNEL_NAME" 2>&1 || true
+    echo
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "── systemctl status cloudflared ──"
+    systemctl --no-pager --lines=3 status cloudflared 2>&1 || true
+  fi
+}
+
+cmd_help() {
+  cat <<EOF
+sxgate $SXGATE_VERSION — manage subdomain↔service routing for a Cloudflare Tunnel.
+
+Usage:
+  sxgate init [--zone <domain>] [--tunnel <name>] [--config <path>]
+  sxgate service add <name> <url>
+  sxgate service ls
+  sxgate service rm <name> [--force]
+  sxgate route add <hostname> <service-name> [--no-dns] [--no-reload]
+  sxgate route ls
+  sxgate route rm <hostname> [--purge-dns] [--no-reload] [--yes]
+  sxgate apply [--restart]
+  sxgate status
+  sxgate --version | --help
+
+Env:
+  SXGATE_YES=1     skip confirmations
+  SXGATE_QUIET=1   only errors to stderr
+  SXGATE_DEBUG=1   trace shell execution
+
+State:
+  /etc/sxgate/sxgate.conf     # zone + tunnel name
+  /etc/sxgate/services        # registered services (name=url)
+  /etc/sxgate/backups/        # config.yml backups (keep last $BACKUP_KEEP)
+  /etc/cloudflared/config.yml # live routing — edited directly by sxgate
+
+Exit codes:
+  0 ok · 1 generic · 2 usage · 3 validation · 4 external · 5 config-state · 10 declined
+EOF
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────
+main() {
+  local cmd=${1:-help}
+  shift || true
+  case "$cmd" in
+    init)        cmd_init "$@" ;;
+    service)     cmd_service "$@" ;;
+    route)       cmd_route "$@" ;;
+    apply)       cmd_apply "$@" ;;
+    status)      cmd_status "$@" ;;
+    --version|-v|version) echo "sxgate $SXGATE_VERSION" ;;
+    -h|--help|help) cmd_help ;;
+    *) die "unknown command: $cmd (run 'sxgate --help')" 2 ;;
+  esac
+}
+
+load_conf
+main "$@"
