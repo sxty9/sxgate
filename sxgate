@@ -120,7 +120,7 @@ validate_hostname() {
   local h=$1
   [[ "$h" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]] \
     || die "invalid hostname '$h'" 3
-  [ -n "$MANAGED_ZONE" ] || die "MANAGED_ZONE not set — run 'sxgate init --zone <domain>' first" 5
+  [ -n "$MANAGED_ZONE" ] || die "MANAGED_ZONE not set — run 'sxgate zone <domain>' first" 5
   if [ "$h" != "$MANAGED_ZONE" ] && [[ "$h" != *".$MANAGED_ZONE" ]]; then
     die "hostname '$h' is outside managed zone '$MANAGED_ZONE'" 3
   fi
@@ -322,7 +322,165 @@ dns_route() {
   cloudflared tunnel route dns "$TUNNEL_NAME" "$host"
 }
 
+# ── bootstrap (sxgate setup) ───────────────────────────────────────────────────
+ensure_cloudflared() {
+  command -v cloudflared >/dev/null 2>&1 && return 0
+  log "installing cloudflared (official Cloudflare apt repo)..."
+  mkdir -p --mode=0755 /usr/share/keyrings
+  curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+    | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+  echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' \
+    > /etc/apt/sources.list.d/cloudflared.list
+  apt-get update -qq
+  apt-get install -y -qq cloudflared
+  command -v cloudflared >/dev/null 2>&1 || die "cloudflared install failed" 4
+}
+
+cf_cert_path() {
+  # Print an existing cloudflared origin cert path, or return non-zero.
+  local c
+  for c in /root/.cloudflared/cert.pem "$HOME/.cloudflared/cert.pem"; do
+    [ -f "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
+ensure_login() {
+  if cf_cert_path >/dev/null; then
+    log "cloudflared already authenticated"
+    return 0
+  fi
+  log "Cloudflare login required — a URL will be printed; open it and authorize your zone."
+  cloudflared tunnel login
+  cf_cert_path >/dev/null || die "cloudflared login did not produce a cert.pem" 4
+}
+
+ensure_tunnel() {
+  # Print the tunnel ID, creating the tunnel if it does not exist yet.
+  local tid; tid=$(get_tunnel_id || true)
+  if [ -z "$tid" ]; then
+    log "creating tunnel '$TUNNEL_NAME'..." >&2
+    cloudflared tunnel create "$TUNNEL_NAME" >&2
+    tid=$(get_tunnel_id || true)
+  fi
+  [ -n "$tid" ] || die "tunnel '$TUNNEL_NAME' could not be created" 4
+  printf '%s' "$tid"
+}
+
+ensure_service() {
+  if systemctl cat cloudflared >/dev/null 2>&1; then
+    log "cloudflared systemd service present — restarting"
+    systemctl restart cloudflared
+  else
+    log "installing cloudflared systemd service..."
+    cloudflared service install
+  fi
+  systemctl enable cloudflared >/dev/null 2>&1 || true
+}
+
 # ── commands ──────────────────────────────────────────────────────────────────
+cmd_setup() {
+  local tunnel="$TUNNEL_NAME"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tunnel) tunnel=$2; shift 2 ;;
+      -h|--help) cat <<EOF; return 0 ;;
+Usage: sxgate setup [--tunnel <name>]
+
+Turnkey bootstrap (run as root): installs cloudflared, logs in to Cloudflare,
+creates the tunnel, scaffolds /etc/cloudflared/config.yml, and installs+starts
+the cloudflared systemd service. Set the DNS zone separately:
+  sxgate zone <domain>
+EOF
+      *) die "unknown flag: $1" 2 ;;
+    esac
+  done
+  needs_root "setup" "${tunnel:+--tunnel}" "${tunnel:+$tunnel}"
+  TUNNEL_NAME=$tunnel
+
+  ensure_cloudflared
+  ensure_login
+  local tid; tid=$(ensure_tunnel)
+
+  # Credentials path — as root the tunnel JSON lands in /root/.cloudflared/.
+  local creds="" cand
+  for cand in "/root/.cloudflared/$tid.json" "$HOME/.cloudflared/$tid.json"; do
+    [ -f "$cand" ] && { creds=$cand; break; }
+  done
+  [ -n "$creds" ] || creds="/root/.cloudflared/$tid.json"
+
+  # Preserve an already-set zone; setup itself does NOT take a zone.
+  local zone=""
+  [ -r "$SXGATE_CONF" ] && { . "$SXGATE_CONF"; zone=${MANAGED_ZONE:-}; }
+  with_lock _setup_scaffold "$tid" "$creds" "$zone"
+
+  ensure_service
+
+  log ""
+  log "sxgate is up. Next:"
+  log "  sxgate zone <domain>            # e.g. henrysoase.org"
+  log "  sxgate service add <name> <url>"
+  log "  sxgate route add <host> <name>"
+}
+_setup_scaffold() {
+  local tid=$1 creds=$2 zone=$3
+  mkdir -p "$(dirname "$SXGATE_CONF")" "$(dirname "$SERVICES_FILE")" "$BACKUP_DIR" "$(dirname "$CONFIG_FILE")"
+  cat > "${SXGATE_CONF}.tmp.$$" <<EOF
+# /etc/sxgate/sxgate.conf — managed by sxgate; safe to edit
+TUNNEL_NAME=$TUNNEL_NAME
+MANAGED_ZONE=$zone
+CONFIG_FILE=$CONFIG_FILE
+EOF
+  atomic_write "$SXGATE_CONF" < "${SXGATE_CONF}.tmp.$$"
+  rm -f "${SXGATE_CONF}.tmp.$$"
+  [ -e "$SERVICES_FILE" ] || { : > "$SERVICES_FILE"; chmod 0644 "$SERVICES_FILE"; }
+  if [ -e "$CONFIG_FILE" ]; then
+    backup_config >/dev/null
+    log "existing $CONFIG_FILE preserved (backup taken)"
+  else
+    cat > "${CONFIG_FILE}.tmp.$$" <<EOF
+tunnel: $tid
+credentials-file: $creds
+ingress:
+  - service: http_status:404
+EOF
+    atomic_write "$CONFIG_FILE" < "${CONFIG_FILE}.tmp.$$"
+    rm -f "${CONFIG_FILE}.tmp.$$"
+    log "scaffolded $CONFIG_FILE"
+  fi
+}
+
+cmd_zone() {
+  case "${1:-}" in
+    -h|--help) printf 'Usage: sxgate zone [<domain>]   # set or show the managed DNS zone\n'; return 0 ;;
+  esac
+  local zone=${1:-}
+  if [ -z "$zone" ]; then
+    load_conf
+    if [ -n "${MANAGED_ZONE:-}" ]; then printf '%s\n' "$MANAGED_ZONE"; else echo "(no zone set — run: sxgate zone <domain>)"; fi
+    return 0
+  fi
+  [[ "$zone" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$ ]] \
+    || die "invalid domain '$zone'" 3
+  needs_root "zone" "$zone"
+  load_conf
+  with_lock _zone_set_locked "$zone"
+}
+_zone_set_locked() {
+  local zone=$1
+  : "${TUNNEL_NAME:=sxgate}" "${CONFIG_FILE:=/etc/cloudflared/config.yml}"
+  mkdir -p "$(dirname "$SXGATE_CONF")"
+  cat > "${SXGATE_CONF}.tmp.$$" <<EOF
+# /etc/sxgate/sxgate.conf — managed by sxgate; safe to edit
+TUNNEL_NAME=$TUNNEL_NAME
+MANAGED_ZONE=$zone
+CONFIG_FILE=$CONFIG_FILE
+EOF
+  atomic_write "$SXGATE_CONF" < "${SXGATE_CONF}.tmp.$$"
+  rm -f "${SXGATE_CONF}.tmp.$$"
+  log "zone set: $zone"
+}
+
 cmd_init() {
   local zone="" tunnel="$TUNNEL_NAME" config="$CONFIG_FILE"
   while [ $# -gt 0 ]; do
@@ -382,7 +540,7 @@ EOF
     fi
     rm -rf "$d"
   fi
-  [ -n "$zone" ] || die "--zone <domain> is required on first init" 2
+  # Zone is optional — `sxgate zone <domain>` can set it later; route add enforces it.
 
   cat > "${SXGATE_CONF}.tmp.$$" <<EOF
 # /etc/sxgate/sxgate.conf — managed by sxgate; safe to edit
@@ -671,7 +829,8 @@ cmd_help() {
 sxgate $SXGATE_VERSION — manage subdomain↔service routing for a Cloudflare Tunnel.
 
 Usage:
-  sxgate init [--zone <domain>] [--tunnel <name>] [--config <path>]
+  sxgate setup [--tunnel <name>]        install cloudflared + tunnel + service (turnkey)
+  sxgate zone [<domain>]                set or show the managed DNS zone
   sxgate service add <name> <url>
   sxgate service ls
   sxgate service rm <name> [--force]
@@ -680,7 +839,14 @@ Usage:
   sxgate route rm <hostname> [--purge-dns] [--no-reload] [--yes]
   sxgate apply [--restart]
   sxgate status
+  sxgate init [--zone <domain>] [--tunnel <name>] [--config <path>]   # low-level scaffold
   sxgate --version | --help
+
+Quickstart:
+  sudo ./sxgate setup
+  sudo ./sxgate zone henrysoase.org
+  sudo ./sxgate service add holistic http://localhost:21487
+  sudo ./sxgate route add holistic.henrysoase.org holistic
 
 Env:
   SXGATE_YES=1     skip confirmations
@@ -703,6 +869,8 @@ main() {
   local cmd=${1:-help}
   shift || true
   case "$cmd" in
+    setup)       cmd_setup "$@" ;;
+    zone)        cmd_zone "$@" ;;
     init)        cmd_init "$@" ;;
     service)     cmd_service "$@" ;;
     route)       cmd_route "$@" ;;

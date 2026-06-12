@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SXGATE="$SCRIPT_DIR/../bin/sxgate"
+SXGATE="$SCRIPT_DIR/../sxgate"
 
 # ── test harness ──────────────────────────────────────────────────────────────
 PASS=0
@@ -47,7 +47,8 @@ setup_env() {
   export SXGATE_YES=1
   export SXGATE_QUIET=1
   export SXGATE_NO_SUDO=1
-  mkdir -p "$BACKUP_DIR"
+  export HOME="$TMP"            # isolate ~/.cloudflared for setup/login checks
+  mkdir -p "$BACKUP_DIR" "$TMP/.cloudflared"
 
   # Mock cloudflared + systemctl onto PATH
   mkdir -p "$TMP/bin"
@@ -87,6 +88,17 @@ case "$1 $2" in
     ;;
   "tunnel info")
     echo "tunnel $3 ok"
+    exit 0
+    ;;
+  "tunnel create")
+    echo "Created tunnel $3 with id mock-tunnel-id"
+    exit 0
+    ;;
+  "tunnel login")
+    echo "logged in"
+    exit 0
+    ;;
+  "service install")
     exit 0
     ;;
 esac
@@ -352,9 +364,55 @@ test_backup_rotation() {
   if [ "$count" -le 5 ]; then ok "rotation keeps ≤5 backups (have $count)"; else fail "rotation keeps ≤5 backups" "have $count"; fi
 }
 
+test_setup_bootstraps() {
+  # cert.pem present → ensure_login skipped; mock tunnel exists → no create needed.
+  touch "$HOME/.cloudflared/cert.pem"
+  "$SXGATE" setup >/dev/null 2>&1 || fail "setup runs" "setup exited nonzero"
+  assert_file_exists "$CONFIG_FILE" "setup scaffolds config.yml"
+  assert_file_contains "$CONFIG_FILE" "tunnel: mock-tunnel-id" "setup writes tunnel id"
+  assert_file_contains "$CONFIG_FILE" "http_status:404" "setup writes catch-all"
+  assert_file_exists "$SXGATE_CONF" "setup writes sxgate.conf"
+  assert_file_exists "$SERVICES_FILE" "setup creates services file"
+  assert_file_contains "$SXGATE_CONF" "MANAGED_ZONE=" "setup leaves zone empty (decoupled)"
+  # Idempotent: second run preserves the config (+ backs it up)
+  before=$(cat "$CONFIG_FILE")
+  "$SXGATE" setup >/dev/null 2>&1
+  after=$(cat "$CONFIG_FILE")
+  assert_eq "$after" "$before" "second setup preserves config"
+}
+
+test_zone_set_and_show() {
+  : > "$SXGATE_CONF"
+  "$SXGATE" zone test.example >/dev/null
+  assert_file_contains "$SXGATE_CONF" "MANAGED_ZONE=test.example" "zone persisted to conf"
+  out=$("$SXGATE" zone)
+  assert_contains "$out" "test.example" "zone (no arg) shows current zone"
+  assert_exit 3 "$SXGATE" zone "not a domain"
+}
+
+test_init_zone_optional() {
+  unset MANAGED_ZONE
+  : > "$SXGATE_CONF"
+  "$SXGATE" init >/dev/null 2>&1 || fail "init without zone" "init exited nonzero"
+  assert_file_exists "$CONFIG_FILE" "init without zone scaffolds config"
+  assert_file_exists "$SXGATE_CONF" "init without zone writes conf"
+}
+
+test_route_requires_zone() {
+  unset MANAGED_ZONE
+  : > "$SXGATE_CONF"
+  write_empty_config
+  "$SXGATE" service add blog http://localhost:2368 >/dev/null
+  assert_exit 5 "$SXGATE" route add blog.test.example blog
+}
+
 # ── run all ───────────────────────────────────────────────────────────────────
 TESTS=(
   test_help_and_version
+  test_setup_bootstraps
+  test_zone_set_and_show
+  test_init_zone_optional
+  test_route_requires_zone
   test_init_scaffolds_config
   test_init_preserves_existing_config
   test_service_crud

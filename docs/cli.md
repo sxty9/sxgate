@@ -11,18 +11,26 @@ Verwaltung von Subdomain↔Service-Routing für einen Cloudflare Tunnel auf eine
 ## Installation
 
 ```bash
-git clone <repo> && cd sxgate
-sudo ./install.sh
-sudo sxgate init --zone henrysoase.org
+git clone https://github.com/sxty9/sxgate.git && cd sxgate
+sudo ./sxgate setup                  # installiert cloudflared, Tunnel, systemd-Service
+sudo ./sxgate zone henrysoase.org    # verwaltete DNS-Zone (entkoppelt)
 ```
 
-`init` erwartet, dass der Tunnel bereits via `cloudflared tunnel create sxgate` angelegt ist und die Credentials in `~/.cloudflared/` liegen.
+Repo-lokal wie `./holistic` — **kein separates Install-Skript**. `setup` bootstrappt alles inkl. `cloudflared`; `zone` legt die DNS-Zone fest.
 
 ## Befehle
 
+### `sxgate setup [--tunnel <name>]`
+
+Turnkey-Bootstrap (als root), idempotent: installiert `cloudflared` (offizielles Cloudflare-apt-Repo) falls nötig → `cloudflared tunnel login` (interaktiv, Browser-URL; übersprungen wenn `cert.pem` existiert) → legt den Tunnel an falls nicht vorhanden → scaffoldet `/etc/cloudflared/config.yml` (Catch-all) + `/etc/sxgate/{sxgate.conf,services}` → `cloudflared service install` + Start. **Setzt bewusst keine Zone** — siehe `sxgate zone`.
+
+### `sxgate zone [<domain>]`
+
+Setzt (`sxgate zone henrysoase.org`) oder zeigt (`sxgate zone`) die verwaltete DNS-Zone in `/etc/sxgate/sxgate.conf`. `route add` validiert Hostnamen gegen diese Zone und verlangt sie.
+
 ### `sxgate init [--zone <domain>] [--tunnel <name>] [--config <path>]`
 
-Einmaliger Setup. Findet die Tunnel-ID via `cloudflared tunnel list`, scaffoldet `/etc/cloudflared/config.yml` falls sie nicht existiert (mit Catch-all), schreibt `/etc/sxgate/sxgate.conf`. Bestehende `config.yml` wird unverändert übernommen und gebackupt.
+Low-Level-Scaffold (von `setup` intern genutzt). Findet die Tunnel-ID via `cloudflared tunnel list`, scaffoldet `/etc/cloudflared/config.yml` falls sie nicht existiert (mit Catch-all), schreibt `/etc/sxgate/sxgate.conf`. Bestehende `config.yml` wird unverändert übernommen und gebackupt. Die Zone ist **optional** (per `sxgate zone` nachsetzbar).
 
 ### `sxgate service add <name> <url>`
 
