@@ -34,7 +34,7 @@ Low-Level-Scaffold (von `setup` intern genutzt). Findet die Tunnel-ID via `cloud
 
 ### `sxgate service add <name> <url>`
 
-Registriert oder aktualisiert einen Service. URL muss `http(s)://…` oder `http_status:NNN` sein. Service-Name muss `^[a-z][a-z0-9-]{0,30}$` matchen.
+Registriert oder aktualisiert einen Service. URL muss `http(s)://…`, `ssh://host:port` oder `http_status:NNN` sein. Service-Name muss `^[a-z][a-z0-9-]{0,30}$` matchen. (`ssh://` → siehe [SSH-Zugang](#ssh-zugang-über-den-tunnel).)
 
 ```bash
 sudo sxgate service add blog http://localhost:2368
@@ -81,6 +81,42 @@ Validiert die config.yml und reloaded den cloudflared-Dienst. Hilfreich nach man
 ### `sxgate status`
 
 Tunnel-Info + systemd-Status.
+
+## SSH-Zugang über den Tunnel
+
+SSH ist nur ein Service mit `ssh://`-Schema — **kein** Sonderbefehl nötig. Standard-Subdomain `ssh.<zone>`:
+
+```bash
+sudo ./sxgate service add ssh ssh://localhost:22
+sudo ./sxgate route   add ssh.henrysoase.org ssh
+```
+
+Damit ist der lokale sshd (Port 22) als `ssh.henrysoase.org` über den Tunnel erreichbar. Andere Subdomain/Port: einfach `service add`-URL bzw. `route add`-Hostname anpassen (z.B. `service add ssh ssh://localhost:2222`, `route add admin.henrysoase.org ssh`).
+
+### Verbinden (Client)
+
+**Wichtig:** Man kann sich **nicht** direkt mit `ssh ssh.henrysoase.org` verbinden. Der Tunnel ist ein ausgehender HTTPS-Tunnel; `ssh.<zone>` zeigt auf Cloudflares Edge, die **nur HTTPS** annimmt — es gibt **keinen offenen Port 22**. Der Client wickelt SSH daher per `cloudflared` in WebSocket-über-HTTPS. Nach einmaliger Einrichtung tippst du trotzdem nur `ssh user@host`.
+
+1. `cloudflared` am Client installieren:
+   - macOS: `brew install cloudflared`
+   - Windows: `winget install --id Cloudflare.cloudflared` (oder `.exe` aus den GitHub-Releases)
+   - Linux: Binary aus den GitHub-Releases nach `/usr/local/bin/cloudflared` + `chmod +x`
+2. Einmalig den ProxyCommand in `~/.ssh/config` eintragen — am einfachsten generiert:
+   ```bash
+   cloudflared access ssh-config --hostname ssh.henrysoase.org >> ~/.ssh/config
+   ```
+   Ergebnis:
+   ```
+   Host ssh.henrysoase.org
+     ProxyCommand cloudflared access ssh --hostname %h
+   ```
+3. Verbinden: `ssh <user>@ssh.henrysoase.org` (Host-Key beim ersten Mal bestätigen). `scp`/`rsync`/`sftp`/`ssh-copy-id`/VS-Code-Remote-SSH laufen transparent über denselben Host.
+
+Troubleshooting: `dig +short ssh.henrysoase.org` → CNAME auf `<tunnel-id>.cfargotunnel.com`; Proxy isoliert testen mit `cloudflared access ssh --hostname ssh.henrysoase.org`; `ssh -v <user>@ssh.henrysoase.org` für Verbose-Logs.
+
+### Sicherheit
+
+Der SSH-Endpoint ist jetzt über den öffentlichen Hostnamen erreichbar (geschützt nur durch SSH-Auth, solange keine Cloudflare-Access-Policy davorhängt). Empfehlung: in `/etc/ssh/sshd_config` `PasswordAuthentication no` setzen und ausschließlich Key-Auth nutzen (Public-Key vorher in `~/.ssh/authorized_keys` des Server-Users hinterlegen). **sxgate ändert sshd nicht automatisch.** Optionale weitere Härtung: Cloudflare Access (Zero Trust) als vorgelagertes Identitäts-Gate.
 
 ## Umgebungsvariablen
 

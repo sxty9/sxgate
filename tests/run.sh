@@ -406,6 +406,22 @@ test_route_requires_zone() {
   assert_exit 5 "$SXGATE" route add blog.test.example blog
 }
 
+test_ssh_service_and_route() {
+  write_empty_config
+  # ssh:// is now an accepted service scheme
+  "$SXGATE" service add ssh ssh://localhost:22 >/dev/null \
+    && ok "ssh:// service accepted" || fail "ssh:// service accepted" "rejected"
+  assert_file_contains "$SERVICES_FILE" "ssh=ssh://localhost:22" "ssh service stored"
+  # routing the ssh subdomain to it writes a normal ingress rule
+  "$SXGATE" route add ssh.test.example ssh >/dev/null
+  assert_file_contains "$CONFIG_FILE" "hostname: ssh.test.example" "ssh hostname written"
+  assert_file_contains "$CONFIG_FILE" "service: ssh://localhost:22" "ssh service url written"
+  tail_line=$(tail -n1 "$CONFIG_FILE")
+  assert_contains "$tail_line" "http_status:404" "catch-all still last"
+  # tcp:// stays rejected on purpose (ssh-only loosening)
+  assert_exit 3 "$SXGATE" service add db tcp://localhost:5432
+}
+
 # ── run all ───────────────────────────────────────────────────────────────────
 TESTS=(
   test_help_and_version
@@ -417,6 +433,7 @@ TESTS=(
   test_init_preserves_existing_config
   test_service_crud
   test_service_validation
+  test_ssh_service_and_route
   test_route_add_inserts_above_catchall
   test_route_idempotent_and_update
   test_route_rejects_out_of_zone

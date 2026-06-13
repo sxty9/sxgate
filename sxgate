@@ -112,8 +112,9 @@ validate_service_name() {
 }
 
 validate_service_url() {
-  [[ "$1" =~ ^https?://[^[:space:]]+$ || "$1" =~ ^http_status:[0-9]{3}$ ]] \
-    || die "invalid service URL '$1' (expected http(s)://… or http_status:NNN)" 3
+  # http(s) for web services, ssh:// for SSH-over-tunnel, http_status:NNN for the catch-all.
+  [[ "$1" =~ ^https?://[^[:space:]]+$ || "$1" =~ ^ssh://[^[:space:]]+$ || "$1" =~ ^http_status:[0-9]{3}$ ]] \
+    || die "invalid service URL '$1' (expected http(s)://…, ssh://host:port, or http_status:NNN)" 3
 }
 
 validate_hostname() {

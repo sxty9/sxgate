@@ -20,5 +20,10 @@ ingress:
   # - hostname: api.henrysoase.org
   #   service: http://localhost:3000
 
+  # Beispiel 3: SSH über den Tunnel (Subdomain ssh.<domain> → lokaler sshd auf Port 22)
+  # Client verbindet via `cloudflared access ssh` — siehe docs/cli.md.
+  # - hostname: ssh.henrysoase.org
+  #   service: ssh://localhost:22
+
   # Pflicht: Catch-all am Ende
   - service: http_status:404

@@ -40,6 +40,26 @@ sudo ./sxgate route   ls
 
 Das CLI legt den DNS-Record an (`cloudflared tunnel route dns …`), schreibt die Ingress-Regel atomisch in `/etc/cloudflared/config.yml` und reloaded den Tunnel. Details: [docs/cli.md](docs/cli.md).
 
+## SSH über den Tunnel
+
+Server-SSH über eine Subdomain (Standard `ssh.<domain>`) erreichbar machen — SSH ist einfach ein Service mit `ssh://`-Schema, kein Sonderbefehl:
+
+```bash
+sudo ./sxgate service add ssh ssh://localhost:22
+sudo ./sxgate route   add ssh.henrysoase.org ssh
+```
+
+**Verbinden:** *Nicht* direkt per `ssh ssh.henrysoase.org` — der Tunnel spricht am Cloudflare-Edge nur HTTPS (kein offener Port 22). Der Client braucht einmalig `cloudflared` + einen ProxyCommand; danach ist der Alltag normales `ssh`:
+
+```bash
+# am Client, einmalig (cloudflared muss installiert sein):
+cloudflared access ssh-config --hostname ssh.henrysoase.org >> ~/.ssh/config
+# danach wie gewohnt:
+ssh <user>@ssh.henrysoase.org
+```
+
+**Sicherheit:** Port 22 ist damit übers Internet erreichbar (nur durch SSH-Auth geschützt) — empfohlen wird ausschließlich Key-Auth (`PasswordAuthentication no` in `/etc/ssh/sshd_config`). Vollständiges Client-Runbook + Hintergrund: [docs/cli.md](docs/cli.md#ssh-zugang-über-den-tunnel).
+
 ## Troubleshooting
 - `cloudflared tunnel list` — zeigt aktive Tunnels
 - `journalctl -u cloudflared -f` — Live-Logs
