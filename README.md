@@ -53,12 +53,22 @@ sudo ./sxgate route   add ssh.henrysoase.org ssh
 
 ```bash
 # am Client, einmalig (cloudflared muss installiert sein):
-cloudflared access ssh-config --hostname ssh.henrysoase.org >> ~/.ssh/config
+cloudflared access ssh-config --hostname ssh.henrysoase.org \
+  | sed -n '/^Host /,$p' >> ~/.ssh/config   # Helper druckt eine Hinweiszeile mit → strippen
 # danach wie gewohnt:
 ssh <user>@ssh.henrysoase.org
 ```
 
-**Sicherheit:** Port 22 ist damit übers Internet erreichbar (nur durch SSH-Auth geschützt) — empfohlen wird ausschließlich Key-Auth (`PasswordAuthentication no` in `/etc/ssh/sshd_config`). Vollständiges Client-Runbook + Hintergrund: [docs/cli.md](docs/cli.md#ssh-zugang-über-den-tunnel).
+**Sicherheit — Key-only erzwingen:** Port 22 ist damit übers Internet erreichbar (nur durch SSH-Auth geschützt). Dringend empfohlen: ausschließlich Key-Auth. Auf dem Server:
+
+```bash
+# 1. Public-Key des Clients in ~/.ssh/authorized_keys des Server-Users hinterlegen UND testen
+# 2. dann Passwort-Login abschalten (Drop-in, vor dem Reload validieren):
+echo 'PasswordAuthentication no' | sudo tee /etc/ssh/sshd_config.d/99-hardening.conf
+sudo sshd -t && sudo systemctl restart ssh.socket
+```
+
+**Wichtig:** Erst Key hinterlegen und einen Login testen — sonst sperrst du dich aus. Optional vorgelagert: Cloudflare Access (Zero Trust). End-to-End-Loopback-Test + vollständiges Client-Runbook: [docs/runbooks/ssh-loopback-selftest.md](docs/runbooks/ssh-loopback-selftest.md); Hintergrund: [docs/cli.md](docs/cli.md#ssh-zugang-über-den-tunnel).
 
 ## Troubleshooting
 - `cloudflared tunnel list` — zeigt aktive Tunnels
