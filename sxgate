@@ -294,10 +294,13 @@ route_remove() {
 # ── tunnel ops ────────────────────────────────────────────────────────────────
 get_tunnel_id() {
   # Look up tunnel ID by name via `cloudflared tunnel list --output json`.
+  # Strip all whitespace first so the parser tolerates compact *and* pretty-printed
+  # JSON — newer cloudflared releases indent the output / add spaces after colons,
+  # which broke the previous exact-match parser.
   local out
   out=$(cloudflared tunnel list --output json 2>/dev/null) || return 1
-  printf '%s' "$out" | awk -v RS='}' -v name="$TUNNEL_NAME" '
-    $0 ~ "\"name\":\""name"\"" {
+  printf '%s' "$out" | tr -d '[:space:]' | awk -v RS='}' -v name="$TUNNEL_NAME" '
+    index($0, "\"name\":\"" name "\"") {
       if (match($0, /"id":"[^"]+"/)) {
         id=substr($0, RSTART+6, RLENGTH-7)
         print id; exit
@@ -361,8 +364,14 @@ ensure_tunnel() {
   local tid; tid=$(get_tunnel_id || true)
   if [ -z "$tid" ]; then
     log "creating tunnel '$TUNNEL_NAME'..." >&2
-    cloudflared tunnel create "$TUNNEL_NAME" >&2
-    tid=$(get_tunnel_id || true)
+    local createout
+    createout=$(cloudflared tunnel create "$TUNNEL_NAME" 2>&1) \
+      || { printf '%s\n' "$createout" >&2; die "tunnel '$TUNNEL_NAME' could not be created" 4; }
+    printf '%s\n' "$createout" >&2
+    # Prefer the UUID straight from the create output (authoritative, no JSON parsing);
+    # fall back to a list lookup if cloudflared ever changes that wording.
+    tid=$(printf '%s' "$createout" | grep -oiE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -n1 || true)
+    [ -n "$tid" ] || tid=$(get_tunnel_id || true)
   fi
   [ -n "$tid" ] || die "tunnel '$TUNNEL_NAME' could not be created" 4
   printf '%s' "$tid"
