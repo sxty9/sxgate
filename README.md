@@ -68,7 +68,7 @@ echo 'PasswordAuthentication no' | sudo tee /etc/ssh/sshd_config.d/99-hardening.
 sudo sshd -t && sudo systemctl restart ssh.socket
 ```
 
-**Wichtig:** Erst Key hinterlegen und einen Login testen — sonst sperrst du dich aus. Optional vorgelagert: Cloudflare Access (Zero Trust). End-to-End-Loopback-Test + vollständiges Client-Runbook: [docs/runbooks/ssh-loopback-selftest.md](docs/runbooks/ssh-loopback-selftest.md); Hintergrund: [docs/cli.md](docs/cli.md#ssh-zugang-über-den-tunnel).
+**Wichtig:** Erst Key hinterlegen und einen Login testen — sonst sperrst du dich aus. Optional vorgelagert: Cloudflare Access (Zero Trust). Client onboarden (cloudflared evtl. nicht installiert, OS-für-OS): [docs/runbooks/ssh-client-onboarding.md](docs/runbooks/ssh-client-onboarding.md). End-to-End-Loopback-Test: [docs/runbooks/ssh-loopback-selftest.md](docs/runbooks/ssh-loopback-selftest.md); Hintergrund: [docs/cli.md](docs/cli.md#ssh-zugang-über-den-tunnel).
 
 ## Troubleshooting
 - `cloudflared tunnel list` — zeigt aktive Tunnels
