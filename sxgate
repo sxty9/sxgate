@@ -825,7 +825,11 @@ cmd_status() {
   echo
   if command -v cloudflared >/dev/null 2>&1; then
     echo "── cloudflared tunnel info $TUNNEL_NAME ──"
-    cloudflared tunnel info "$TUNNEL_NAME" 2>&1 || true
+    if [ "$(id -u)" -eq 0 ] || cf_cert_path >/dev/null 2>&1; then
+      cloudflared tunnel info "$TUNNEL_NAME" 2>&1 || true
+    else
+      echo "(tunnel details need the root-only Cloudflare origin cert; run 'sudo $0 status')"
+    fi
     echo
   fi
   if command -v systemctl >/dev/null 2>&1; then
