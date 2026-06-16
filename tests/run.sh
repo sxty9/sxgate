@@ -485,11 +485,13 @@ test_preview_setup() {
   assert_file_exists "$PREVIEW_LIBEXEC/preview-run" "launcher installed"
   assert_file_exists "$PREVIEW_SYSTEMD_DIR/sxgate-preview@.service" "instance template installed"
   assert_file_exists "$PREVIEW_SYSTEMD_DIR/sxgate-preview-proxy.service" "dispatcher unit installed"
-  assert_file_contains "$CONFIG_FILE" "hostname: *.test.example" "wildcard ingress added"
+  # Wildcard MUST be YAML-quoted (a bare leading * is a YAML alias → cloudflared rejects it).
+  assert_file_contains "$CONFIG_FILE" 'hostname: "*.test.example"' "wildcard ingress added (quoted)"
+  assert_file_not_contains "$CONFIG_FILE" 'hostname: *.test.example' "wildcard not emitted unquoted"
   tail_line=$(tail -n1 "$CONFIG_FILE"); assert_contains "$tail_line" "http_status:404" "catch-all still last"
   "$SXGATE" preview setup >/dev/null 2>&1
-  count=$(grep -cF 'hostname: *.test.example' "$CONFIG_FILE")
-  assert_eq "$count" "1" "wildcard ingress not duplicated (idempotent)"
+  count=$(grep -cF 'hostname: "*.test.example"' "$CONFIG_FILE")
+  assert_eq "$count" "1" "wildcard ingress not duplicated (idempotent round-trip)"
 }
 
 test_preview_up_static_proxy() {

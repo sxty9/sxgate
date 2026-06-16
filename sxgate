@@ -206,6 +206,7 @@ yaml_split() {
       if (match(line, /^[[:space:]]*-[[:space:]]+hostname:[[:space:]]*/)) {
         cur_host=substr(line, RSTART+RLENGTH)
         sub(/[[:space:]]+$/, "", cur_host)
+        sub(/^"/, "", cur_host); sub(/"$/, "", cur_host)   # YAML-quoted hosts (e.g. wildcards) → bare
         next
       }
       if (match(line, /^[[:space:]]*-?[[:space:]]*service:[[:space:]]*/)) {
@@ -233,7 +234,12 @@ yaml_emit() {
   if [ -s "$dir/tuples" ]; then
     while IFS=$'\t' read -r host svc; do
       [ -z "$host" ] && continue
-      printf '  - hostname: %s\n    service: %s\n' "$host" "$svc"
+      # Quote hostnames with YAML-special chars (notably the `*` of a wildcard, which YAML
+      # would otherwise read as an alias) so cloudflared accepts the emitted config.
+      case "$host" in
+        *[!A-Za-z0-9.-]*) printf '  - hostname: "%s"\n    service: %s\n' "$host" "$svc" ;;
+        *)                printf '  - hostname: %s\n    service: %s\n' "$host" "$svc" ;;
+      esac
     done < "$dir/tuples"
   fi
   printf '  - service: %s\n' "$(cat "$dir/catchall")"
