@@ -82,6 +82,52 @@ Validiert die config.yml und reloaded den cloudflared-Dienst. Hilfreich nach man
 
 Tunnel-Info + systemd-Status.
 
+## Preview-Sandboxes (`sxgate preview`)
+
+Pro-Branch-Sandboxes für **jeden** über sxgate gehosteten Service — Feature-Testing auf einer
+eigenen URL, ohne dass parallele Branches im selben Repo/Deploy kollidieren. Schema (flach,
+gratis, vom bestehenden `*.<zone>`-Universal-Cert abgedeckt):
+
+```
+prod:    <service>.henrysoase.org
+sandbox: <branch>-<service>.henrysoase.org      # z.B. feat-profile-holistic.henrysoase.org
+```
+
+Der Tunnel wird **einmalig** angefasst (eine Wildcard-Ingress `*.<zone>` → ein lokaler
+Dispatcher-Caddy). Danach editieren `up`/`down` nur die Dispatcher-Drop-ins + systemd-Instanzen
+— **nie** cloudflared/DNS. So bleibt sxgate pro Branch unbelastet.
+
+```bash
+sudo sxgate preview setup                 # einmalig: Wildcard-Ingress + Dispatcher + Units + User
+# danach einmal manuell in Cloudflare: proxied  *  CNAME  <tunnel-id>.cfargotunnel.com
+sudo sxgate preview up <branch>           # aus einem Repo mit .sxgate/preview.conf
+sudo sxgate preview ls
+sudo sxgate preview rebuild <slug|branch> # nach neuen Commits: pull + build + restart
+sudo sxgate preview down <slug|branch>
+```
+
+### Service-Manifest: `.sxgate/preview.conf`
+
+Ein **sourcebares** Shell-Fragment im Service-Repo. Platzhalter `{worktree} {state} {zone}
+{port}` expandiert die Engine (Laufzeit-Werte über `{port}`, **nicht** `$PORT` — die Datei wird
+gesourcet). Schlüssel:
+
+| Key | Zweck |
+|-----|-------|
+| `SERVICE` | Basisname; Host = `<branch>-<service>.<zone>` |
+| `BUILD` | Build-Kommando (im Worktree); optional |
+| `MODE` | `static_proxy` (SPA + `/api`-Proxy) · `proxy` (reiner Reverse-Proxy) · `static` |
+| `ROOT` | statisches Verzeichnis (für `static`/`static_proxy`) |
+| `API_PREFIX` | an das Backend proxyter Pfad (Default `/api`) |
+| `RUN` | Backend-Kommando, bindet `127.0.0.1:{port}` |
+| `RUN_CWD` / `RUN_ENV` | Arbeitsverzeichnis + env (hier lebt die **Sandbox-Isolation**, z.B. Fake-Auth) |
+| `SEED` | optional; läuft nach Anlegen von `{state}`, stdout erscheint als „notes“ |
+| `HEALTHCHECK` | optionaler Pfad, auf 2xx gewartet wird |
+| `HOOK` | Escape-Hatch-Script: `HOOK build <wt> <state>` · `HOOK serve <wt> <port> <state>` |
+
+Die Sandbox-Sicherheit (Fake-PAM/-Daten, Wegwerf-State) ist **Service-Sache** und steht im
+`RUN_ENV` — die Engine selbst kennt weder Sprache noch Auth des Service.
+
 ## SSH-Zugang über den Tunnel
 
 SSH ist nur ein Service mit `ssh://`-Schema — **kein** Sonderbefehl nötig. Standard-Subdomain `ssh.<zone>`:
@@ -151,6 +197,13 @@ Der SSH-Endpoint ist jetzt über den öffentlichen Hostnamen erreichbar (geschü
 /etc/sxgate/backups/        # config.yml.<UTC-Timestamp> — letzten 5
 /etc/cloudflared/config.yml # Live-Config (sxgate editiert direkt)
 /var/lock/sxgate.lock       # flock für concurrent CLI-Invocations
+
+# Preview (sxgate preview):
+/etc/sxgate/preview/Caddyfile      # Dispatcher-Basis (import sites.d/*.caddy)
+/etc/sxgate/preview/sites.d/       # ein vhost-Drop-in pro lebendem Sandbox
+/etc/sxgate/preview/instances/     # <slug>.env (systemd) + <slug>.meta (ls/teardown)
+/srv/sxgate-previews/<slug>/       # git worktree + Build-Artefakte + state
+/usr/local/lib/sxgate/preview-run  # generischer Instanz-Launcher
 ```
 
 ## FAQ

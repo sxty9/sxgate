@@ -113,6 +113,22 @@ exit 0
 EOF
   chmod +x "$TMP/bin/systemctl"
 
+  # Mock caddy (preview dispatcher): validate/run/reload all succeed.
+  cat > "$TMP/bin/caddy" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$TMP/bin/caddy"
+
+  # Preview engine state → all under $TMP, small port pool.
+  export PREVIEW_ETC="$TMP/preview-etc"
+  export PREVIEW_ROOT="$TMP/preview-root"
+  export PREVIEW_LIBEXEC="$TMP/libexec"
+  export PREVIEW_SYSTEMD_DIR="$TMP/systemd"
+  export PREVIEW_DISPATCH_PORT=21490
+  export PREVIEW_PORT_LO=8800
+  export PREVIEW_PORT_HI=8802
+
   # `flock` may not exist on macOS; provide a no-op stub if missing.
   if ! command -v flock >/dev/null 2>&1; then
     cat > "$TMP/bin/flock" <<'EOF'
@@ -422,6 +438,120 @@ test_ssh_service_and_route() {
   assert_exit 3 "$SXGATE" service add db tcp://localhost:5432
 }
 
+# ── preview tests ───────────────────────────────────────────────────────────────
+
+# Create a throwaway git service repo at $TMP/svc with a .sxgate/preview.conf + a feat/x branch.
+make_service_repo() {
+  local mode=${1:-static_proxy} repo="$TMP/svc"
+  mkdir -p "$repo/.sxgate"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email t@t.t
+  git -C "$repo" config user.name t
+  if [ "$mode" = proxy ]; then
+    cat > "$repo/.sxgate/preview.conf" <<'EOF'
+SERVICE="demo"
+MODE="proxy"
+RUN="/bin/true --port {port}"
+EOF
+  else
+    cat > "$repo/.sxgate/preview.conf" <<'EOF'
+SERVICE="demo"
+BUILD="mkdir -p dist && echo hi > dist/index.html"
+MODE="static_proxy"
+ROOT="dist"
+API_PREFIX="/api"
+RUN="/bin/true serve --port {port}"
+RUN_CWD="."
+RUN_ENV="
+FOO=bar
+STATE_DIR={state}
+"
+SEED="echo invite=ABC123"
+HEALTHCHECK="/api/health"
+EOF
+  fi
+  git -C "$repo" add -A
+  git -C "$repo" commit -qm init
+  git -C "$repo" branch feat/x
+  printf '%s' "$repo"
+}
+
+test_preview_setup() {
+  write_empty_config
+  "$SXGATE" preview setup >/dev/null 2>&1 || fail "preview setup runs" "nonzero exit"
+  assert_file_exists "$PREVIEW_ETC/Caddyfile" "dispatcher Caddyfile written"
+  assert_file_contains "$PREVIEW_ETC/Caddyfile" "import $PREVIEW_ETC/sites.d/*.caddy" "imports sites.d"
+  assert_file_contains "$PREVIEW_ETC/Caddyfile" ":21490" "listens on dispatch port"
+  assert_file_exists "$PREVIEW_LIBEXEC/preview-run" "launcher installed"
+  assert_file_exists "$PREVIEW_SYSTEMD_DIR/sxgate-preview@.service" "instance template installed"
+  assert_file_exists "$PREVIEW_SYSTEMD_DIR/sxgate-preview-proxy.service" "dispatcher unit installed"
+  assert_file_contains "$CONFIG_FILE" "hostname: *.test.example" "wildcard ingress added"
+  tail_line=$(tail -n1 "$CONFIG_FILE"); assert_contains "$tail_line" "http_status:404" "catch-all still last"
+  "$SXGATE" preview setup >/dev/null 2>&1
+  count=$(grep -cF 'hostname: *.test.example' "$CONFIG_FILE")
+  assert_eq "$count" "1" "wildcard ingress not duplicated (idempotent)"
+}
+
+test_preview_up_static_proxy() {
+  local repo; repo=$(make_service_repo static_proxy)
+  write_empty_config
+  "$SXGATE" preview setup >/dev/null 2>&1
+  "$SXGATE" preview up --repo "$repo" feat/x >/dev/null 2>&1 || fail "preview up runs" "nonzero exit"
+  local slug=feat-x-demo
+  assert_file_exists "$PREVIEW_ROOT/$slug/repo/dist/index.html" "BUILD produced static output in the worktree"
+  assert_file_contains "$PREVIEW_ETC/sites.d/$slug.caddy" "http://$slug.test.example:21490" "vhost keyed by host:dispatch-port"
+  assert_file_contains "$PREVIEW_ETC/sites.d/$slug.caddy" "reverse_proxy 127.0.0.1:8800" "api proxied to backend port"
+  assert_file_contains "$PREVIEW_ETC/sites.d/$slug.caddy" "$PREVIEW_ROOT/$slug/repo/dist" "static root points into worktree"
+  assert_file_contains "$PREVIEW_ETC/instances/$slug.env" "PORT=8800" "port recorded"
+  assert_file_contains "$PREVIEW_ETC/instances/$slug.env" "--port 8800" "RUN expanded {port}"
+  assert_file_contains "$PREVIEW_ETC/instances/$slug.env" "STATE_DIR=$PREVIEW_ROOT/$slug/state" "RUN_ENV expanded {state}"
+  assert_file_contains "$PREVIEW_ETC/instances/$slug.meta" "BRANCH=feat/x" "meta records branch"
+  out=$("$SXGATE" preview ls)
+  assert_contains "$out" "$slug" "ls shows the slug"
+  assert_contains "$out" "feat-x-demo.test.example" "ls shows the URL host"
+}
+
+test_preview_proxy_mode() {
+  local repo; repo=$(make_service_repo proxy)
+  write_empty_config
+  "$SXGATE" preview setup >/dev/null 2>&1
+  "$SXGATE" preview up --repo "$repo" feat/x >/dev/null 2>&1 || fail "proxy up runs" "nonzero exit"
+  local slug=feat-x-demo
+  assert_file_contains "$PREVIEW_ETC/sites.d/$slug.caddy" "reverse_proxy 127.0.0.1:8800" "proxy mode reverse-proxies"
+  assert_file_not_contains "$PREVIEW_ETC/sites.d/$slug.caddy" "file_server" "proxy mode has no static server"
+}
+
+test_preview_up_requires_setup() {
+  local repo; repo=$(make_service_repo proxy)
+  write_empty_config
+  assert_exit 5 "$SXGATE" preview up --repo "$repo" feat/x
+}
+
+test_preview_port_allocation() {
+  local repo; repo=$(make_service_repo proxy)
+  write_empty_config
+  "$SXGATE" preview setup >/dev/null 2>&1
+  "$SXGATE" preview up --repo "$repo" feat/x >/dev/null 2>&1
+  git -C "$repo" branch feat/y
+  "$SXGATE" preview up --repo "$repo" feat/y >/dev/null 2>&1
+  local p1 p2
+  p1=$(grep '^PORT=' "$PREVIEW_ETC/instances/feat-x-demo.env" | cut -d= -f2)
+  p2=$(grep '^PORT=' "$PREVIEW_ETC/instances/feat-y-demo.env" | cut -d= -f2)
+  [ "$p1" != "$p2" ] && ok "concurrent previews get distinct ports" || fail "distinct ports" "both got $p1"
+}
+
+test_preview_down() {
+  local repo; repo=$(make_service_repo proxy)
+  write_empty_config
+  "$SXGATE" preview setup >/dev/null 2>&1
+  "$SXGATE" preview up --repo "$repo" feat/x >/dev/null 2>&1
+  local slug=feat-x-demo
+  "$SXGATE" preview down "$slug" >/dev/null 2>&1 || fail "down runs" "nonzero exit"
+  [ ! -e "$PREVIEW_ETC/sites.d/$slug.caddy" ] && ok "vhost drop-in removed" || fail "vhost removed" "still present"
+  [ ! -e "$PREVIEW_ETC/instances/$slug.env" ] && ok "instance env removed" || fail "instance env removed" "present"
+  [ ! -d "$PREVIEW_ROOT/$slug" ] && ok "worktree dir removed" || fail "worktree dir removed" "present"
+}
+
 # ── run all ───────────────────────────────────────────────────────────────────
 TESTS=(
   test_help_and_version
@@ -445,6 +575,12 @@ TESTS=(
   test_validation_failure_rolls_back
   test_yaml_parser_rejects_missing_catchall
   test_backup_rotation
+  test_preview_setup
+  test_preview_up_static_proxy
+  test_preview_proxy_mode
+  test_preview_up_requires_setup
+  test_preview_port_allocation
+  test_preview_down
 )
 
 # Allow running a single test by name

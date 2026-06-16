@@ -96,5 +96,21 @@ bash tests/run.sh
 
 Vollständige Referenz: [docs/cli.md](docs/cli.md).
 
+## Preview-Sandboxes
+
+Pro-Branch-Feature-Sandboxes für **jeden** über sxgate gehosteten Service — eigene URL, kein
+Kollidieren paralleler Branches im selben Repo/Deploy:
+
+```bash
+sudo ./sxgate preview setup          # einmalig: Wildcard-Ingress *.zone → Dispatcher (+ DNS-Hinweis)
+sudo ./sxgate preview up <branch>    # aus einem Repo mit .sxgate/preview.conf
+#  → https://<branch>-<service>.henrysoase.org
+sudo ./sxgate preview ls | rebuild <x> | down <x>
+```
+
+Der Tunnel wird nur einmal angefasst; danach editieren `up`/`down` nur einen lokalen
+Dispatcher-Caddy + systemd-Instanzen. Jeder Service beschreibt Build/Run in `.sxgate/preview.conf`
+(inkl. eigener Sandbox-Isolation, z.B. Fake-Auth). Voll dokumentiert: [docs/cli.md](docs/cli.md#preview-sandboxes-sxgate-preview).
+
 ## Mehr
 Siehe [docs/architecture.md](docs/architecture.md) für Glossar und Konzepte (DNS, Tunnel, Reverse Proxy, CGNAT).
