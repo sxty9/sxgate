@@ -112,5 +112,32 @@ Der Tunnel wird nur einmal angefasst; danach editieren `up`/`down` nur einen lok
 Dispatcher-Caddy + systemd-Instanzen. Jeder Service beschreibt Build/Run in `.sxgate/preview.conf`
 (inkl. eigener Sandbox-Isolation, z.B. Fake-Auth). Voll dokumentiert: [docs/cli.md](docs/cli.md#preview-sandboxes-sxgate-preview).
 
+## Mail-Edge (für den holistic Mailserver `maild`)
+
+Der öffentliche Mail-Ein-/Ausgang für den holistic Mailserver — der Tunnel trägt nur HTTP,
+klassisches SMTP lässt sich nicht durchreichen. `maild` besitzt Postfächer + API und stellt
+interne Mail direkt zu; **sxgate besitzt die Netzwerkkante**:
+
+- **Eingang:** Cloudflare Email Routing → ein Email Worker → HTTPS-Webhook an `maild`
+  (`POST /api/services/mail/inbound`, per gemeinsamem Secret authentifiziert).
+- **Ausgang:** `maild` spoolt → lokaler Egress-Relay (`sxgate-mail-egress`) → **DKIM-signiert**
+  → Übergabe an einen Smarthost (SMTP-Submission).
+- **DNS:** MX (via Email Routing), SPF, DKIM, DMARC.
+
+```bash
+sudo ./sxgate mail setup --domain henrysoase.org              # Secrets, DKIM, Egress-Relay,
+                                                              # maild-Drop-in, Email-Worker + DNS-Records
+sudo ./sxgate mail relay set smtp.provider.com:587 --user me  # Smarthost für den Ausgang
+sudo ./sxgate mail dkim-record                                # DKIM-TXT-Record fürs DNS
+sudo ./sxgate mail test-inbound --to user@henrysoase.org      # Eingangs-Kontrakt gegen maild prüfen
+sudo ./sxgate mail status
+```
+
+`setup` legt die lokalen Teile selbst an (Secrets, DKIM-Keypair, Egress-Build, systemd-Units,
+Worker); die Cloudflare-Schritte (Email Routing aktivieren, `wrangler deploy`, Inbound-Secret als
+Worker-Secret, DNS-Records) werden ausgegeben. Der Egress-Relay (`edge/egress/`, reines Go-Stdlib)
+signiert DKIM (relaxed/relaxed, rsa-sha256) und relayed über den Smarthost. Quelle: `lib/mail.sh`
++ `edge/`.
+
 ## Mehr
 Siehe [docs/architecture.md](docs/architecture.md) für Glossar und Konzepte (DNS, Tunnel, Reverse Proxy, CGNAT).

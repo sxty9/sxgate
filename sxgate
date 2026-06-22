@@ -25,6 +25,9 @@ SXGATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Preview engine (sxgate preview …) — defines cmd_preview. Optional: absent on minimal installs.
 # shellcheck source=lib/preview.sh
 [ -r "$SXGATE_DIR/lib/preview.sh" ] && . "$SXGATE_DIR/lib/preview.sh"
+# Mail edge (sxgate mail …) — defines cmd_mail. Optional: absent on minimal installs.
+# shellcheck source=lib/mail.sh
+[ -r "$SXGATE_DIR/lib/mail.sh" ] && . "$SXGATE_DIR/lib/mail.sh"
 
 # ── output ────────────────────────────────────────────────────────────────────
 log()  { [ "$SXGATE_QUIET" = "1" ] || printf '%s\n' "$*"; }
@@ -866,6 +869,7 @@ Usage:
   sxgate preview setup                  one-time: wildcard ingress + dispatcher (for ALL services)
   sxgate preview up <branch>            spin up <branch>-<service>.<zone> from a repo's .sxgate/preview.conf
   sxgate preview ls | rebuild <x> | down <x>
+  sxgate mail setup|relay|dkim-record|test-inbound|status   public mail edge for maild
   sxgate apply [--restart]
   sxgate status
   sxgate init [--zone <domain>] [--tunnel <name>] [--config <path>]   # low-level scaffold
@@ -904,6 +908,7 @@ main() {
     service)     cmd_service "$@" ;;
     route)       cmd_route "$@" ;;
     preview)     command -v cmd_preview >/dev/null 2>&1 || die "preview engine not installed (lib/preview.sh missing)" 5; cmd_preview "$@" ;;
+    mail)        command -v cmd_mail >/dev/null 2>&1 || die "mail edge not installed (lib/mail.sh missing)" 5; cmd_mail "$@" ;;
     apply)       cmd_apply "$@" ;;
     status)      cmd_status "$@" ;;
     --version|-v|version) echo "sxgate $SXGATE_VERSION" ;;
