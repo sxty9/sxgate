@@ -158,6 +158,8 @@ Environment=EGRESS_SMARTHOST_PASS_FILE=$MAIL_SMARTHOST_PASS
 ExecStart=$MAIL_EGRESS_BIN
 Restart=on-failure
 RestartSec=2
+# Writable spool for accept-and-queue outbound delivery (/var/lib/sxgate-mail-egress).
+StateDirectory=sxgate-mail-egress
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

@@ -117,6 +117,11 @@ func TestHandleOutboundRelaysAndSigns(t *testing.T) {
 		domain:    "example.test",
 		smarthost: smtp.addr(),
 	}
+	sp, err := newSpool(t.TempDir(), cfg.relay)
+	if err != nil {
+		t.Fatalf("newSpool: %v", err)
+	}
+	cfg.spool = sp
 
 	req := httptest.NewRequest(http.MethodPost, "/outbound", strings.NewReader(sampleMsg))
 	req.Header.Set("X-Mail-Edge-Secret", "edge-secret")
@@ -129,6 +134,8 @@ func TestHandleOutboundRelaysAndSigns(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
 	}
+	// Accept-and-queue: the handler acked; the worker relays. Flush once to deliver synchronously.
+	cfg.spool.flush()
 	select {
 	case <-smtp.done:
 	case <-time.After(5 * time.Second):
@@ -168,5 +175,64 @@ func TestHandleOutboundAuthAndConfig(t *testing.T) {
 	cfg2.handleOutbound(rec2, req2)
 	if rec2.Code != http.StatusServiceUnavailable {
 		t.Errorf("no smarthost: status = %d, want 503", rec2.Code)
+	}
+}
+
+// TestSpoolDedup: re-accepting the same idempotency key is a no-op (one spooled job), so a
+// resubmission never re-sends.
+func TestSpoolDedup(t *testing.T) {
+	dir := t.TempDir()
+	sp, err := newSpool(dir, func(string, []string, []byte) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := []byte("Message-ID: <dup@x>\r\n\r\nhi")
+	key := idempotencyKey(msg)
+	if _, ok, _ := sp.accept(key, "a@b.test", []string{"c@d.test"}, msg); !ok {
+		t.Fatal("first accept should succeed")
+	}
+	if _, ok, _ := sp.accept(key, "a@b.test", []string{"c@d.test"}, msg); ok {
+		t.Error("duplicate accept should be a no-op")
+	}
+	n := 0
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".json") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("spooled %d jobs, want 1 (dedup)", n)
+	}
+}
+
+// TestSpoolDeadLetters: a persistently failing relay is retried at most maxAttempts times and then
+// dead-lettered — no infinite loop.
+func TestSpoolDeadLetters(t *testing.T) {
+	var calls int
+	dir := t.TempDir()
+	sp, err := newSpool(dir, func(string, []string, []byte) error {
+		calls++
+		return fmt.Errorf("relay down")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, ok, err := sp.accept("k1", "a@b.test", []string{"c@d.test"}, []byte("Message-ID: <k1>\r\n\r\nhi"))
+	if err != nil || !ok {
+		t.Fatalf("accept: id=%q ok=%v err=%v", id, ok, err)
+	}
+	// Advance 'now' each call so the backoff never defers the attempt.
+	for i := 0; i < maxAttempts+3; i++ {
+		_ = sp.deliver(id, time.Now().Add(time.Duration(i+1)*time.Hour))
+	}
+	if calls > maxAttempts {
+		t.Errorf("relay called %d times, want at most %d", calls, maxAttempts)
+	}
+	if _, err := os.Stat(filepath.Join(dir, id+".json")); !os.IsNotExist(err) {
+		t.Errorf("job still active after dead-letter (err=%v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "failed", id+".json")); err != nil {
+		t.Errorf("job not dead-lettered to failed/: %v", err)
 	}
 }
