@@ -26,6 +26,16 @@
 : "${PREVIEW_USER:=sxgate-preview}"              # unprivileged owner of dispatcher + instances
 : "${PREVIEW_CADDY:=caddy}"                      # caddy binary
 
+# ── per-user isolation (DevLab) ─────────────────────────────────────────────────
+# When PREVIEW_RUNAS is set, EVERY step that touches branch-authored bytes (reading the
+# manifest, the worktree checkout, BUILD/HOOK/SEED, and the long-lived RUN service) executes
+# ONLY as that Linux user via the pinned, path-confined PREVIEW_EXEC — never as root. Root keeps
+# only branch-code-free wiring (ports, sites.d/instances/drop-in, daemon-reload). Unset ⇒ the
+# engine behaves byte-for-byte as before (the operator's own previews are unaffected).
+: "${PREVIEW_RUNAS:=}"   # target Linux user for untrusted steps (DevLab: the requesting user)
+: "${PREVIEW_EXEC:=}"    # pinned confined executor reaching PREVIEW_RUNAS (DevLab: devlab-exec)
+: "${PREVIEW_BASE:=}"    # user-owned base for worktree+state when PREVIEW_RUNAS set
+
 # ── helpers ─────────────────────────────────────────────────────────────────────
 
 # Branch + service → a single DNS label slug, e.g. "feat/profile" + "holistic"
@@ -110,6 +120,32 @@ _pv_read_manifest() {
     . "$1"
     declare -p SERVICE BUILD MODE ROOT API_PREFIX RUN RUN_CWD RUN_ENV SEED HEALTHCHECK HOOK
   )
+}
+
+# Untrusted step indirection: run the pinned confined executor AS the target user.
+_pv_uexec() { sudo -n -u "$PREVIEW_RUNAS" "$PREVIEW_EXEC" "$@"; }
+
+# The manifest key set the engine understands (the ONLY names ever imported).
+_PV_KEYS=(SERVICE BUILD MODE ROOT API_PREFIX RUN RUN_CWD RUN_ENV SEED HEALTHCHECK HOOK)
+
+# SAFE manifest read for the per-user path — the counterpart to _pv_read_manifest that NEVER
+# lets branch bytes reach a root shell. The executor (as U) sources the manifest with its own
+# output muted, then emits ONLY the known keys as NUL-delimited KEY=VALUE via a slash-pathed
+# printf (immune to function shadowing). Here (root) we parse that stream as pure DATA — read
+# -d '' with first-wins per key, NO eval — so a hostile manifest can neither run code at root nor
+# inject extra keys. Populates the _PV_KEYS variables. Requires PREVIEW_RUNAS/PREVIEW_EXEC.
+_pv_read_manifest_safe() {
+  local mf=$1 k v rec seen=' '
+  SERVICE='' BUILD='' MODE='static_proxy' ROOT='' API_PREFIX='/api' \
+    RUN='' RUN_CWD='.' RUN_ENV='' SEED='' HEALTHCHECK='' HOOK=''
+  while IFS= read -r -d '' rec; do
+    k=${rec%%=*}; v=${rec#*=}
+    case "$seen" in *" $k "*) continue ;; esac      # first-wins (defeats trailing/EXIT-trap records)
+    case " ${_PV_KEYS[*]} " in *" $k "*) : ;; *) continue ;; esac  # known keys only
+    printf -v "$k" '%s' "$v"                          # assign by fixed-name; value is inert data
+    seen="$seen$k "
+  done < <(_pv_uexec pv-manifest "$mf")
+  [ -n "$SERVICE" ]
 }
 
 _pv_used_ports() { grep -hsoE '^PORT=[0-9]+' "$PREVIEW_ETC"/instances/*.env 2>/dev/null | cut -d= -f2; }
@@ -315,12 +351,31 @@ _pv_chown() {
   return 0
 }
 
+# Validate the per-user execution identity BEFORE any sudo -u. No-op unless PREVIEW_RUNAS is set.
+_pv_validate_runas() {
+  [ -n "$PREVIEW_RUNAS" ] || return 0
+  [[ "$PREVIEW_RUNAS" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "invalid --as-user '$PREVIEW_RUNAS'" 2
+  id -u "$PREVIEW_RUNAS" >/dev/null 2>&1 || die "no such user: $PREVIEW_RUNAS" 2
+  local groups; groups=$(id -nG "$PREVIEW_RUNAS" 2>/dev/null | tr ' ' '\n')
+  printf '%s\n' "$groups" | grep -qxE 'hp_devlab_access|sudo' \
+    || die "$PREVIEW_RUNAS is not preview-eligible (needs hp_devlab_access)" 77
+  # fix #2: refuse to run untrusted code as a user who carries a privileged read group — gid
+  # devlab/holistic would let the long-lived RUN read every workspace + the AES link-key.
+  printf '%s\n' "$groups" | grep -qxE 'devlab|holistic' \
+    && die "$PREVIEW_RUNAS is in a privileged group (devlab/holistic) — refusing" 77
+  [ -n "$PREVIEW_EXEC" ] && [ -x "$PREVIEW_EXEC" ] || die "--exec <executor> required (+executable) with --as-user" 2
+  [ -n "$PREVIEW_BASE" ] || die "--base <dir> required with --as-user" 2
+}
+
 _pv_cmd_up() {
   local repo='' from='' branch=''
   while [ $# -gt 0 ]; do
     case "$1" in
       --repo) repo=$2; shift 2 ;;
       --from) from=$2; shift 2 ;;
+      --as-user) PREVIEW_RUNAS=$2; shift 2 ;;
+      --exec) PREVIEW_EXEC=$2; shift 2 ;;
+      --base) PREVIEW_BASE=$2; shift 2 ;;
       -h | --help) _pv_usage; return 0 ;;
       -*) die "unknown flag: $1" 2 ;;
       *) [ -z "$branch" ] && branch=$1 || die "unexpected argument: $1" 2; shift ;;
@@ -330,72 +385,152 @@ _pv_cmd_up() {
   load_conf
   [ -n "${MANAGED_ZONE:-}" ] || die "no zone set — run 'sxgate zone <domain>' first" 5
   [ -f "$PREVIEW_ETC/Caddyfile" ] || die "preview not set up — run 'sxgate preview setup' first" 5
+  _pv_validate_runas
   local repo_root
-  repo_root=$(_pv_find_repo "${repo:-$PWD}") || die "no .sxgate/preview.conf found in ${repo:-$PWD} or its parents" 5
+  if [ -n "$PREVIEW_RUNAS" ]; then
+    # The repo is the user's own workspace — never walk/stat the tree as root. Trust the caller's
+    # --repo (devlab-preview derives it from the session user) and require the manifest present.
+    [ -n "$repo" ] || die "--repo is required with --as-user" 2
+    repo_root=$repo
+    [ -f "$repo_root/.sxgate/preview.conf" ] || die "no .sxgate/preview.conf in $repo_root" 5
+  else
+    repo_root=$(_pv_find_repo "${repo:-$PWD}") || die "no .sxgate/preview.conf found in ${repo:-$PWD} or its parents" 5
+  fi
   with_lock _pv_up_locked "$repo_root" "$branch" "$from"
+}
+
+# RUNAS-aware rollback: in the per-user path everything is undone AS the user via the executor.
+_pv_rollback_any() {
+  if [ -n "$PREVIEW_RUNAS" ]; then
+    local slug=$1 repo=$2
+    [ -n "$repo" ] && _pv_uexec pv-worktree-remove "$repo" "$PREVIEW_BASE/$slug/repo" >/dev/null 2>&1 || true
+    _pv_uexec pv-rm "$PREVIEW_BASE/$slug" >/dev/null 2>&1 || true
+    rm -f "$PREVIEW_ETC/sites.d/$slug.caddy" "$PREVIEW_ETC/instances/$slug".{env,meta,pw} 2>/dev/null || true
+    rm -rf "$PREVIEW_SYSTEMD_DIR/sxgate-preview@$slug.service.d" 2>/dev/null || true
+  else
+    _pv_rollback "$@"
+  fi
+}
+
+# Per-slug systemd drop-in: run the untrusted RUN backend AS the user (never root, never group
+# devlab), sandboxed to its own preview dir. Overrides the template's User=$PREVIEW_USER.
+_pv_write_dropin() {
+  local slug=$1 d="$PREVIEW_SYSTEMD_DIR/sxgate-preview@$slug.service.d"
+  mkdir -p "$d"
+  cat > "$d/runas.conf" <<EOF
+[Service]
+User=$PREVIEW_RUNAS
+Group=$PREVIEW_RUNAS
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+ReadWritePaths=$PREVIEW_BASE/$slug
+InaccessiblePaths=-/var/lib/devlab/links -/etc/devlab
+EOF
 }
 
 _pv_up_locked() {
   local repo_root=$1 branch=$2 from=$3
   local mf="$repo_root/.sxgate/preview.conf"
-  eval "$(_pv_read_manifest "$mf")" || die "could not read manifest $mf" 5
-  [ -n "$SERVICE" ] || die "manifest $mf is missing SERVICE" 3
+  if [ -n "$PREVIEW_RUNAS" ]; then
+    _pv_read_manifest_safe "$mf" || die "could not read manifest $mf (missing SERVICE?)" 5   # fix #1: no root eval
+  else
+    eval "$(_pv_read_manifest "$mf")" || die "could not read manifest $mf" 5
+    [ -n "$SERVICE" ] || die "manifest $mf is missing SERVICE" 3
+  fi
   validate_service_name "$SERVICE"
   : "${MODE:=static_proxy}" "${API_PREFIX:=/api}" "${RUN_CWD:=.}"
 
   local slug host wt state
   slug=$(_pv_slug "$branch" "$SERVICE")
+  [ -n "$PREVIEW_RUNAS" ] && slug="$PREVIEW_RUNAS-$slug"          # fix #3: namespace per user
   [[ "$slug" =~ ^[a-z0-9][a-z0-9-]{0,61}$ ]] || die "computed slug '$slug' is not a valid DNS label" 3
   host="$slug.$MANAGED_ZONE"
-  wt="$PREVIEW_ROOT/$slug/repo"
-  state="$PREVIEW_ROOT/$slug/state"
+  if [ -n "$PREVIEW_RUNAS" ]; then
+    wt="$PREVIEW_BASE/$slug/repo"; state="$PREVIEW_BASE/$slug/state"
+  else
+    wt="$PREVIEW_ROOT/$slug/repo"; state="$PREVIEW_ROOT/$slug/state"
+  fi
   [ -e "$PREVIEW_ETC/instances/$slug.meta" ] && die "preview '$slug' already exists — use 'sxgate preview rebuild $branch' or 'down' first" 3
 
   local port; port=$(_pv_alloc_port) || die "no free preview port in $PREVIEW_PORT_LO-$PREVIEW_PORT_HI" 1
 
   # 1. isolated worktree
-  mkdir -p "$PREVIEW_ROOT/$slug"
-  if git -C "$repo_root" show-ref --verify --quiet "refs/heads/$branch"; then
-    git -C "$repo_root" worktree add "$wt" "$branch" >/dev/null 2>&1 \
-      || { _pv_rollback "$slug" "$repo_root"; die "git worktree add failed for branch '$branch' (already checked out?)" 1; }
+  if [ -n "$PREVIEW_RUNAS" ]; then
+    # Detached checkout of the committed branch SHA, AS the user (their own repo → git's
+    # dubious-ownership guard never fires, and root never touches the user's .git).
+    _pv_uexec pv-worktree-add "$repo_root" "$wt" "$branch" \
+      || { _pv_rollback_any "$slug" "$repo_root"; die "worktree add failed for '$branch'" 1; }
   else
-    git -C "$repo_root" worktree add -b "$branch" "$wt" "${from:-HEAD}" >/dev/null 2>&1 \
-      || { _pv_rollback "$slug" "$repo_root"; die "git worktree add -b '$branch' from '${from:-HEAD}' failed" 1; }
+    mkdir -p "$PREVIEW_ROOT/$slug"
+    if git -C "$repo_root" show-ref --verify --quiet "refs/heads/$branch"; then
+      git -C "$repo_root" worktree add "$wt" "$branch" >/dev/null 2>&1 \
+        || { _pv_rollback "$slug" "$repo_root"; die "git worktree add failed for branch '$branch' (already checked out?)" 1; }
+    else
+      git -C "$repo_root" worktree add -b "$branch" "$wt" "${from:-HEAD}" >/dev/null 2>&1 \
+        || { _pv_rollback "$slug" "$repo_root"; die "git worktree add -b '$branch' from '${from:-HEAD}' failed" 1; }
+    fi
   fi
 
-  # 2. build (manifest BUILD or HOOK build)
-  mkdir -p "$state"
-  if [ -n "${HOOK:-}" ]; then
-    ( cd "$wt" && PORT="$port" bash "$wt/$HOOK" build "$wt" "$state" ) \
-      || { _pv_rollback "$slug" "$repo_root"; die "hook build failed" 1; }
-  elif [ -n "${BUILD:-}" ]; then
-    ( cd "$wt" && bash -c "$(_pv_expand "$BUILD" "$wt" "$state" "$MANAGED_ZONE" "$port")" ) \
-      || { _pv_rollback "$slug" "$repo_root"; die "build failed" 1; }
+  # 2. build (manifest BUILD or HOOK). Root only EXPANDS placeholders (pure substitution, no eval);
+  # the untrusted command runs as the user via the executor (DEVLAB_PV_CMD env, never argv).
+  if [ -n "$PREVIEW_RUNAS" ]; then
+    _pv_uexec pv-mkdir "$state" || { _pv_rollback_any "$slug" "$repo_root"; die "could not create state dir" 1; }
+    if [ -n "${HOOK:-}" ]; then
+      DEVLAB_PV_CMD="PORT=$port bash $wt/$HOOK build $wt $state" _pv_uexec pv-build "$wt" \
+        || { _pv_rollback_any "$slug" "$repo_root"; die "hook build failed" 1; }
+    elif [ -n "${BUILD:-}" ]; then
+      DEVLAB_PV_CMD="$(_pv_expand "$BUILD" "$wt" "$state" "$MANAGED_ZONE" "$port")" _pv_uexec pv-build "$wt" \
+        || { _pv_rollback_any "$slug" "$repo_root"; die "build failed" 1; }
+    fi
+  else
+    mkdir -p "$state"
+    if [ -n "${HOOK:-}" ]; then
+      ( cd "$wt" && PORT="$port" bash "$wt/$HOOK" build "$wt" "$state" ) \
+        || { _pv_rollback "$slug" "$repo_root"; die "hook build failed" 1; }
+    elif [ -n "${BUILD:-}" ]; then
+      ( cd "$wt" && bash -c "$(_pv_expand "$BUILD" "$wt" "$state" "$MANAGED_ZONE" "$port")" ) \
+        || { _pv_rollback "$slug" "$repo_root"; die "build failed" 1; }
+    fi
   fi
 
   # 3. seed (optional) — stdout shown to the user as notes
   local notes=''
   if [ -n "${SEED:-}" ]; then
-    notes=$( cd "$wt" && PORT="$port" bash -c "$(_pv_expand "$SEED" "$wt" "$state" "$MANAGED_ZONE" "$port")" ) \
-      || warn "seed command failed"
+    if [ -n "$PREVIEW_RUNAS" ]; then
+      notes=$(DEVLAB_PV_CMD="$(_pv_expand "$SEED" "$wt" "$state" "$MANAGED_ZONE" "$port")" _pv_uexec pv-build "$wt") \
+        || warn "seed command failed"
+    else
+      notes=$( cd "$wt" && PORT="$port" bash -c "$(_pv_expand "$SEED" "$wt" "$state" "$MANAGED_ZONE" "$port")" ) \
+        || warn "seed command failed"
+    fi
   fi
-  _pv_chown "$slug"
+  [ -z "$PREVIEW_RUNAS" ] && _pv_chown "$slug"
 
-  # 3b. password gate (DevLab forces this via PREVIEW_PASSWORD=1; legacy CLI opt-in). The hash
-  # goes into the root-owned vhost; the plaintext is stored root-owned for retrieval/sharing.
+  # 3a. pure-static manifest under RUNAS → synthesize a user-owned static server (the shared
+  # dispatcher can't read the user's worktree, so it must be served by the user's own process).
+  if [ -n "$PREVIEW_RUNAS" ] && [ -z "${RUN:-}" ] && [ -z "${HOOK:-}" ]; then
+    RUN="python3 -m http.server {port} --bind 127.0.0.1 --directory {worktree}/${ROOT:-.}"
+  fi
+
+  # 3b. password gate (DevLab forces PREVIEW_PASSWORD=1; legacy CLI opt-in). The hash goes into the
+  # root-owned vhost; the plaintext is stored root-owned for retrieval/sharing.
   local pwhash='' pw='' pwfile="$PREVIEW_ETC/instances/$slug.pw"
   if [ -n "${PREVIEW_PASSWORD:-}" ]; then
     pw=$(_pv_gen_password)
-    pwhash=$(_pv_hash_password "$pw") || { _pv_rollback "$slug" "$repo_root"; die "could not hash preview password (caddy hash-password failed)" 4; }
+    pwhash=$(_pv_hash_password "$pw") || { _pv_rollback_any "$slug" "$repo_root"; die "could not hash preview password (caddy hash-password failed)" 4; }
     ( umask 077; printf '%s\n' "$pw" > "$pwfile" )
     chgrp "$PREVIEW_PW_GROUP" "$pwfile" 2>/dev/null && chmod 0640 "$pwfile" 2>/dev/null || true
   fi
 
-  # 4. dispatcher vhost
-  _pv_render_vhost "$host" "$MODE" "$wt" "${ROOT:-}" "$API_PREFIX" "$port" "$pwhash" \
+  # 4. dispatcher vhost. Under RUNAS force proxy mode (dispatcher can't read the user tree).
+  local eff_mode="$MODE"
+  [ -n "$PREVIEW_RUNAS" ] && eff_mode=proxy
+  _pv_render_vhost "$host" "$eff_mode" "$wt" "${ROOT:-}" "$API_PREFIX" "$port" "$pwhash" \
     | atomic_write "$PREVIEW_ETC/sites.d/$slug.caddy"
 
-  # 5. backend instance (if the service has one)
+  # 5. backend instance (if the service has one — always, under RUNAS, from step 3a)
   if [ -n "${RUN:-}" ] || [ -n "${HOOK:-}" ]; then
     local run runcwd
     if [ -n "${HOOK:-}" ]; then
@@ -406,6 +541,7 @@ _pv_up_locked() {
     runcwd=$(_pv_expand "$RUN_CWD" "$wt" "$state" "$MANAGED_ZONE" "$port")
     case "$runcwd" in /*) ;; *) runcwd="$wt/$runcwd" ;; esac
     _pv_write_instance_env "$slug" "$port" "$runcwd" "$run" "$wt" "$state"
+    [ -n "$PREVIEW_RUNAS" ] && _pv_write_dropin "$slug"     # fix #2: run RUN as the user, sandboxed
     if command -v systemctl >/dev/null 2>&1; then
       systemctl daemon-reload 2>/dev/null || true
       systemctl enable --now "sxgate-preview@$slug" >/dev/null 2>&1 || warn "could not start sxgate-preview@$slug"
@@ -415,10 +551,10 @@ _pv_up_locked() {
   # 6. publish + record
   _pv_reload_dispatcher
   _pv_write_meta "$slug" "$branch" "$SERVICE" "$repo_root" "$port" "$host" "$MODE"
-  _pv_chown "$slug"
+  [ -z "$PREVIEW_RUNAS" ] && _pv_chown "$slug"
 
   log "preview up: https://$host"
-  log "  slug=$slug  branch=$branch  service=$SERVICE  port=$port  mode=$MODE"
+  log "  slug=$slug  branch=$branch  service=$SERVICE  port=$port  mode=$eff_mode"
   [ -n "$pw" ] && log "  password: $pw   (login user: preview)"
   if [ -n "$notes" ]; then
     log "  ── notes ──"
@@ -441,6 +577,9 @@ _pv_write_instance_env() {
       done <<< "$RUN_ENV"
     fi
   } | atomic_write "$PREVIEW_ETC/instances/$slug.env"
+  # fix #6: the env can carry RUN_ENV values — keep it out of world-read. systemd reads it as
+  # root before dropping to User=, so it need not be user-readable.
+  [ -n "$PREVIEW_RUNAS" ] && chmod 0640 "$PREVIEW_ETC/instances/$slug.env" 2>/dev/null
 }
 
 _pv_write_meta() {
@@ -452,18 +591,32 @@ _pv_write_meta() {
     printf 'PORT=%s\n' "$5"
     printf 'HOST=%s\n' "$6"
     printf 'MODE=%s\n' "$7"
+    # Root-written ownership record — the authoritative guard for down/rebuild (a user can't forge
+    # it; instances/ is root-only). Present only for per-user previews.
+    [ -n "$PREVIEW_RUNAS" ] && printf 'OWNER=%s\n' "$PREVIEW_RUNAS"
   } | atomic_write "$PREVIEW_ETC/instances/$1.meta"
 }
 
 # ── rebuild / down / ls ───────────────────────────────────────────────────────
 _pv_cmd_rebuild() {
-  local arg=${1:-}; [ -n "$arg" ] || die "usage: sxgate preview rebuild <slug|branch>" 2
+  local arg=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --as-user | --exec | --base) die "rebuild does not support per-user mode — use down + up" 2 ;;
+      -*) die "unknown flag: $1" 2 ;;
+      *) [ -z "$arg" ] && arg=$1 || die "unexpected argument: $1" 2; shift ;;
+    esac
+  done
+  [ -n "$arg" ] || die "usage: sxgate preview rebuild <slug|branch>" 2
   load_conf
   local slug; slug=$(_pv_resolve_slug "$arg") || die "no preview matching '$arg'" 3
   with_lock _pv_rebuild_locked "$slug"
 }
 _pv_rebuild_locked() {
   local slug=$1 repo wt state
+  # A per-user preview's repo/manifest is user-owned; rebuilding it via the root CLI would
+  # root-eval / root-git untrusted code. Refuse — those are rebuilt as the owner (down+up).
+  [ -n "$(_pv_meta_get "$slug" OWNER)" ] && die "'$slug' is a per-user (DevLab) preview — rebuild it there, not via the operator CLI" 3
   repo=$(_pv_meta_get "$slug" REPO); wt="$PREVIEW_ROOT/$slug/repo"; state="$PREVIEW_ROOT/$slug/state"
   [ -d "$wt" ] || die "worktree missing for '$slug'" 5
   git -C "$wt" pull --ff-only >/dev/null 2>&1 || warn "git pull skipped (no upstream / local branch) — rebuilding current worktree"
@@ -480,21 +633,58 @@ _pv_rebuild_locked() {
   log "preview rebuilt: $slug"
 }
 
+# Under RUNAS, a user may only touch their OWN previews: the slug must be <user>-prefixed AND the
+# root-written OWNER= meta must match. (No-op for the legacy operator path.)
+_pv_assert_owner() {
+  [ -n "$PREVIEW_RUNAS" ] || return 0
+  case "$1" in "$PREVIEW_RUNAS"-*) : ;; *) die "not your preview: $1" 77 ;; esac
+  [ "$(_pv_meta_get "$1" OWNER)" = "$PREVIEW_RUNAS" ] || die "owner mismatch for preview '$1'" 77
+}
+
 _pv_cmd_down() {
-  local arg=${1:-}; [ -n "$arg" ] || die "usage: sxgate preview down <slug|branch>" 2
+  local arg=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --as-user) PREVIEW_RUNAS=$2; shift 2 ;;
+      --exec) PREVIEW_EXEC=$2; shift 2 ;;
+      --base) PREVIEW_BASE=$2; shift 2 ;;
+      --yes) SXGATE_YES=1; shift ;;
+      -*) die "unknown flag: $1" 2 ;;
+      *) [ -z "$arg" ] && arg=$1 || die "unexpected argument: $1" 2; shift ;;
+    esac
+  done
+  [ -n "$arg" ] || die "usage: sxgate preview down [--as-user U] <slug|branch>" 2
   load_conf
+  _pv_validate_runas
   local slug; slug=$(_pv_resolve_slug "$arg") || die "no preview matching '$arg'" 3
+  # A per-user preview must be torn down AS its owner (never root-touch the user's repo). Refuse
+  # the legacy path for owned previews unless the owner is supplied.
+  if [ -z "$PREVIEW_RUNAS" ] && [ -n "$(_pv_meta_get "$slug" OWNER)" ]; then
+    die "'$slug' is a per-user (DevLab) preview — remove it there (or pass --as-user <owner>)" 3
+  fi
+  _pv_assert_owner "$slug"
+  [[ "$slug" =~ ^[a-z0-9][a-z0-9-]{0,61}$ ]] || die "invalid slug '$slug'" 3   # fix #3: no traversal
   confirm "remove preview '$slug' (worktree, instance, route)?" || die "aborted" 10
   with_lock _pv_down_locked "$slug"
 }
 _pv_down_locked() {
   local slug=$1 repo wt
-  repo=$(_pv_meta_get "$slug" REPO); wt="$PREVIEW_ROOT/$slug/repo"
+  repo=$(_pv_meta_get "$slug" REPO)
   command -v systemctl >/dev/null 2>&1 && systemctl disable --now "sxgate-preview@$slug" >/dev/null 2>&1
   rm -f "$PREVIEW_ETC/sites.d/$slug.caddy" "$PREVIEW_ETC/instances/$slug.env" "$PREVIEW_ETC/instances/$slug.meta" "$PREVIEW_ETC/instances/$slug.pw"
-  _pv_reload_dispatcher
-  [ -n "$repo" ] && [ -d "$wt" ] && git -C "$repo" worktree remove --force "$wt" 2>/dev/null || true
-  rm -rf "${PREVIEW_ROOT:?}/$slug"
+  if [ -n "$PREVIEW_RUNAS" ]; then
+    rm -rf "$PREVIEW_SYSTEMD_DIR/sxgate-preview@$slug.service.d"
+    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
+    _pv_reload_dispatcher
+    wt="$PREVIEW_BASE/$slug/repo"
+    [ -n "$repo" ] && _pv_uexec pv-worktree-remove "$repo" "$wt" >/dev/null 2>&1 || true
+    _pv_uexec pv-rm "$PREVIEW_BASE/$slug" >/dev/null 2>&1 || true
+  else
+    _pv_reload_dispatcher
+    wt="$PREVIEW_ROOT/$slug/repo"
+    [ -n "$repo" ] && [ -d "$wt" ] && git -C "$repo" worktree remove --force "$wt" 2>/dev/null || true
+    rm -rf "${PREVIEW_ROOT:?}/$slug"
+  fi
   log "preview down: $slug"
 }
 
