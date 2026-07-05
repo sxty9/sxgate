@@ -47,6 +47,47 @@ _pv_expand() {
   printf '%s' "$s"
 }
 
+# ── preview password gate ────────────────────────────────────────────────────────
+# Every preview created with PREVIEW_PASSWORD set is protected by a simple passphrase of
+# three random codewords (apple-tiger-moon), enforced at the dispatcher via Caddy basic_auth
+# (bcrypt). The gate is rendered by root into the dispatcher vhost, so branch code can never
+# read or remove it. The plaintext is stored root-owned (0640 root:$PREVIEW_PW_GROUP) so the
+# operator — and DevLab, which shows it to the user to share — can retrieve it; the vhost holds
+# only the bcrypt hash. External testers need no account: just the passphrase (user: preview).
+: "${PREVIEW_PW_GROUP:=root}"   # group that may read the plaintext (.pw); DevLab sets it to 'devlab'
+
+# Curated, unambiguous, family-friendly wordlist (no lookalikes like l/1/o/0). 128 words →
+# 128^3 ≈ 2M combos; fronted by Cloudflare + slow bcrypt this is ample for a preview gate.
+_PV_WORDS=(
+  amber anchor apple arch arrow autumn bamboo basil beacon berry birch bison
+  bloom brave breeze bright bronze brook cabin cactus canyon cedar cherry cloud
+  clover cobalt comet copper coral cove crane crisp crystal dawn delta desert
+  diamond dune eagle ember falcon fern flame flint forest fox garnet ginger
+  glacier granite harbor hazel heron honey ivory jade jasmine juniper kayak koala
+  lagoon lantern lark laurel lemon lily lotus lunar maple marble meadow mint
+  mirror misty moss nectar nimbus north oak ocean olive onyx opal orbit
+  otter pebble pepper pine plum polar prairie pumpkin quartz quill rapid raven
+  reef ripple river robin rose ruby sage sable saffron sapphire shadow shell
+  silver slate solar spark sphinx spruce storm summit sunny tango teal thistle
+  tiger topaz tulip tundra umber velvet violet walnut willow zephyr zinc
+)
+
+# Emit three random words joined by '-'. Uses /dev/urandom (not $RANDOM) for real entropy.
+_pv_gen_password() {
+  local n=${#_PV_WORDS[@]} out=() i r
+  for _ in 1 2 3; do
+    r=$(od -An -N2 -tu2 < /dev/urandom | tr -d ' ')
+    i=$(( r % n ))
+    out+=("${_PV_WORDS[$i]}")
+  done
+  ( IFS='-'; printf '%s' "${out[*]}" )
+}
+
+# bcrypt-hash a passphrase with the caddy binary (for the dispatcher basic_auth block).
+_pv_hash_password() {
+  "$PREVIEW_CADDY" hash-password --algorithm bcrypt --plaintext "$1"
+}
+
 # Walk up from $1 (or $PWD) to find the repo holding .sxgate/preview.conf; print its root.
 _pv_find_repo() {
   local d=${1:-$PWD}
@@ -99,8 +140,13 @@ _pv_resolve_slug() {
 # Render one dispatcher vhost: every preview listens on the dispatcher port and is keyed
 # by Host; cloudflared forwards the original Host, so Caddy multiplexes by it.
 _pv_render_vhost() {
-  local host=$1 mode=$2 wt=$3 root=$4 api=$5 port=$6
+  local host=$1 mode=$2 wt=$3 root=$4 api=$5 port=$6 pwhash=${7:-}
   printf 'http://%s:%s {\n\tbind 127.0.0.1 ::1\n' "$host" "$PREVIEW_DISPATCH_PORT"
+  # Password gate (root-rendered; branch code can neither read nor drop it). Applies to the
+  # whole site, so it protects both the static and the proxied handles below.
+  if [ -n "$pwhash" ]; then
+    printf '\tbasic_auth {\n\t\tpreview %s\n\t}\n' "$pwhash"
+  fi
   case "$mode" in
     proxy)
       printf '\treverse_proxy 127.0.0.1:%s\n' "$port" ;;
@@ -260,7 +306,7 @@ _pv_rollback() {
   [ -n "$repo" ] && [ -d "$PREVIEW_ROOT/$slug/repo" ] \
     && git -C "$repo" worktree remove --force "$PREVIEW_ROOT/$slug/repo" 2>/dev/null || true
   rm -rf "${PREVIEW_ROOT:?}/$slug" 2>/dev/null || true
-  rm -f "$PREVIEW_ETC/sites.d/$slug.caddy" "$PREVIEW_ETC/instances/$slug.env" "$PREVIEW_ETC/instances/$slug.meta" 2>/dev/null || true
+  rm -f "$PREVIEW_ETC/sites.d/$slug.caddy" "$PREVIEW_ETC/instances/$slug.env" "$PREVIEW_ETC/instances/$slug.meta" "$PREVIEW_ETC/instances/$slug.pw" 2>/dev/null || true
 }
 
 _pv_chown() {
@@ -335,8 +381,18 @@ _pv_up_locked() {
   fi
   _pv_chown "$slug"
 
+  # 3b. password gate (DevLab forces this via PREVIEW_PASSWORD=1; legacy CLI opt-in). The hash
+  # goes into the root-owned vhost; the plaintext is stored root-owned for retrieval/sharing.
+  local pwhash='' pw='' pwfile="$PREVIEW_ETC/instances/$slug.pw"
+  if [ -n "${PREVIEW_PASSWORD:-}" ]; then
+    pw=$(_pv_gen_password)
+    pwhash=$(_pv_hash_password "$pw") || { _pv_rollback "$slug" "$repo_root"; die "could not hash preview password (caddy hash-password failed)" 4; }
+    ( umask 077; printf '%s\n' "$pw" > "$pwfile" )
+    chgrp "$PREVIEW_PW_GROUP" "$pwfile" 2>/dev/null && chmod 0640 "$pwfile" 2>/dev/null || true
+  fi
+
   # 4. dispatcher vhost
-  _pv_render_vhost "$host" "$MODE" "$wt" "${ROOT:-}" "$API_PREFIX" "$port" \
+  _pv_render_vhost "$host" "$MODE" "$wt" "${ROOT:-}" "$API_PREFIX" "$port" "$pwhash" \
     | atomic_write "$PREVIEW_ETC/sites.d/$slug.caddy"
 
   # 5. backend instance (if the service has one)
@@ -363,6 +419,7 @@ _pv_up_locked() {
 
   log "preview up: https://$host"
   log "  slug=$slug  branch=$branch  service=$SERVICE  port=$port  mode=$MODE"
+  [ -n "$pw" ] && log "  password: $pw   (login user: preview)"
   if [ -n "$notes" ]; then
     log "  ── notes ──"
     printf '%s\n' "$notes" | sed 's/^/  /'
@@ -434,7 +491,7 @@ _pv_down_locked() {
   local slug=$1 repo wt
   repo=$(_pv_meta_get "$slug" REPO); wt="$PREVIEW_ROOT/$slug/repo"
   command -v systemctl >/dev/null 2>&1 && systemctl disable --now "sxgate-preview@$slug" >/dev/null 2>&1
-  rm -f "$PREVIEW_ETC/sites.d/$slug.caddy" "$PREVIEW_ETC/instances/$slug.env" "$PREVIEW_ETC/instances/$slug.meta"
+  rm -f "$PREVIEW_ETC/sites.d/$slug.caddy" "$PREVIEW_ETC/instances/$slug.env" "$PREVIEW_ETC/instances/$slug.meta" "$PREVIEW_ETC/instances/$slug.pw"
   _pv_reload_dispatcher
   [ -n "$repo" ] && [ -d "$wt" ] && git -C "$repo" worktree remove --force "$wt" 2>/dev/null || true
   rm -rf "${PREVIEW_ROOT:?}/$slug"
@@ -442,16 +499,28 @@ _pv_down_locked() {
 }
 
 _pv_cmd_ls() {
-  local m slug any=0
-  printf '%-30s %-18s %-6s %s\n' SLUG BRANCH PORT URL
+  local m slug any=0 lock
+  printf '%-30s %-18s %-6s %-6s %s\n' SLUG BRANCH PORT AUTH URL
   for m in "$PREVIEW_ETC"/instances/*.meta; do
     [ -e "$m" ] || continue
     any=1; slug=$(basename "${m%.meta}")
-    printf '%-30s %-18s %-6s https://%s\n' \
-      "$slug" "$(_pv_meta_get "$slug" BRANCH)" "$(_pv_meta_get "$slug" PORT)" "$(_pv_meta_get "$slug" HOST)"
+    lock=$([ -f "$PREVIEW_ETC/instances/$slug.pw" ] && echo 'pw' || echo '-')
+    printf '%-30s %-18s %-6s %-6s https://%s\n' \
+      "$slug" "$(_pv_meta_get "$slug" BRANCH)" "$(_pv_meta_get "$slug" PORT)" "$lock" "$(_pv_meta_get "$slug" HOST)"
   done
   [ "$any" = 0 ] && log "(no previews)"
   return 0
+}
+
+# Print a preview's passphrase (root-only; the .pw file is root-owned). Also useful to DevLab,
+# which reads the file directly via its group.
+_pv_cmd_pw() {
+  local arg=${1:-}; [ -n "$arg" ] || die "usage: sxgate preview pw <slug|branch>" 2
+  load_conf
+  local slug; slug=$(_pv_resolve_slug "$arg") || die "no preview matching '$arg'" 3
+  local f="$PREVIEW_ETC/instances/$slug.pw"
+  [ -f "$f" ] || die "preview '$slug' has no password set" 3
+  cat "$f"
 }
 
 # ── dispatch ────────────────────────────────────────────────────────────────────
@@ -463,6 +532,10 @@ Usage:
   sxgate preview rebuild <slug|branch>              re-pull + rebuild + restart
   sxgate preview down <slug|branch>                 stop + remove route + worktree
   sxgate preview ls
+  sxgate preview pw <slug|branch>                   print the preview's passphrase (if protected)
+
+Set PREVIEW_PASSWORD=1 on 'up' to gate the preview behind a 3-word passphrase (Caddy basic_auth,
+login user 'preview'); the passphrase is printed once and re-shown by 'preview pw'.
 
 A service repo opts in with .sxgate/preview.conf (sourced; placeholders {worktree} {state}
 {zone} {port}). Keys: SERVICE, BUILD, MODE (static_proxy|proxy|static), ROOT, API_PREFIX,
@@ -474,7 +547,7 @@ cmd_preview() {
   local sub=${1:-}
   case "$sub" in
     ls | list | "" | -h | --help) : ;;   # read-only / help: no root
-    *) needs_root preview "$@" ;;          # re-exec the whole 'preview <sub> …' as root
+    *) needs_root preview "$@" ;;          # re-exec as root: up/down/rebuild/setup, and pw (root file)
   esac
   shift || true
   case "$sub" in
@@ -483,6 +556,7 @@ cmd_preview() {
     rebuild) _pv_cmd_rebuild "$@" ;;
     down) _pv_cmd_down "$@" ;;
     ls | list) _pv_cmd_ls "$@" ;;
+    pw) _pv_cmd_pw "$@" ;;
     "" | -h | --help) _pv_usage ;;
     *) die "unknown subcommand: preview $sub" 2 ;;
   esac
