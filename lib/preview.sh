@@ -151,9 +151,13 @@ _pv_read_manifest_safe() {
 _pv_used_ports() { grep -hsoE '^PORT=[0-9]+' "$PREVIEW_ETC"/instances/*.env 2>/dev/null | cut -d= -f2; }
 
 _pv_alloc_port() {
-  local p used; used=$(_pv_used_ports)
+  local p used bound; used=$(_pv_used_ports)
+  # review #3: also skip ports that are actually bound right now, so a pre-squatted port is never
+  # handed to a new preview. (Does not close the restart-window squat — see the unix-socket follow-up.)
+  bound=$(ss -ltnH 2>/dev/null | grep -oE '127.0.0.1:[0-9]+|\[::1\]:[0-9]+|0.0.0.0:[0-9]+|\*:[0-9]+' | grep -oE '[0-9]+$')
   for ((p = PREVIEW_PORT_LO; p <= PREVIEW_PORT_HI; p++)); do
     printf '%s\n' "$used" | grep -qx "$p" && continue
+    printf '%s\n' "$bound" | grep -qx "$p" && continue
     printf '%s' "$p"; return 0
   done
   return 1
@@ -427,6 +431,10 @@ ProtectSystem=strict
 ProtectHome=tmpfs
 ReadWritePaths=$PREVIEW_BASE/$slug
 InaccessiblePaths=-/var/lib/devlab/links -/etc/devlab
+# review #6: bound a runaway/fork-bombing RUN on the shared host.
+MemoryMax=768M
+CPUQuota=100%
+TasksMax=256
 EOF
 }
 
@@ -595,6 +603,9 @@ _pv_write_meta() {
     # it; instances/ is root-only). Present only for per-user previews.
     [ -n "$PREVIEW_RUNAS" ] && printf 'OWNER=%s\n' "$PREVIEW_RUNAS"
   } | atomic_write "$PREVIEW_ETC/instances/$1.meta"
+  # review #9: don't leak every user's OWNER/PORT/REPO/BRANCH world-readably. devlabd reads it via
+  # group devlab.
+  [ -n "$PREVIEW_RUNAS" ] && { chgrp devlab "$PREVIEW_ETC/instances/$1.meta" 2>/dev/null; chmod 0640 "$PREVIEW_ETC/instances/$1.meta" 2>/dev/null; }
 }
 
 # ── rebuild / down / ls ───────────────────────────────────────────────────────
@@ -670,7 +681,10 @@ _pv_cmd_down() {
 _pv_down_locked() {
   local slug=$1 repo wt
   repo=$(_pv_meta_get "$slug" REPO)
-  command -v systemctl >/dev/null 2>&1 && systemctl disable --now "sxgate-preview@$slug" >/dev/null 2>&1
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now "sxgate-preview@$slug" >/dev/null 2>&1
+    systemctl reset-failed "sxgate-preview@$slug" >/dev/null 2>&1 || true   # review #10: no leftover failed units
+  fi
   rm -f "$PREVIEW_ETC/sites.d/$slug.caddy" "$PREVIEW_ETC/instances/$slug.env" "$PREVIEW_ETC/instances/$slug.meta" "$PREVIEW_ETC/instances/$slug.pw"
   if [ -n "$PREVIEW_RUNAS" ]; then
     rm -rf "$PREVIEW_SYSTEMD_DIR/sxgate-preview@$slug.service.d"
@@ -705,9 +719,19 @@ _pv_cmd_ls() {
 # Print a preview's passphrase (root-only; the .pw file is root-owned). Also useful to DevLab,
 # which reads the file directly via its group.
 _pv_cmd_pw() {
-  local arg=${1:-}; [ -n "$arg" ] || die "usage: sxgate preview pw <slug|branch>" 2
+  local arg=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --as-user) PREVIEW_RUNAS=$2; shift 2 ;;
+      --exec | --base) shift 2 ;;   # accepted for symmetry; unused by pw
+      -*) die "unknown flag: $1" 2 ;;
+      *) [ -z "$arg" ] && arg=$1 || die "unexpected argument: $1" 2; shift ;;
+    esac
+  done
+  [ -n "$arg" ] || die "usage: sxgate preview pw [--as-user U] <slug|branch>" 2
   load_conf
   local slug; slug=$(_pv_resolve_slug "$arg") || die "no preview matching '$arg'" 3
+  _pv_assert_owner "$slug"   # review #8: authoritative OWNER check (not just a slug-prefix match)
   local f="$PREVIEW_ETC/instances/$slug.pw"
   [ -f "$f" ] || die "preview '$slug' has no password set" 3
   cat "$f"
