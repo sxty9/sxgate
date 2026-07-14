@@ -177,6 +177,24 @@ _pv_resolve_slug() {
   return 1
 }
 
+# An SPA shell must NEVER be cached. Its <script src> points at a content-hashed bundle, so a stale
+# index.html pins the browser to a stale app — and iOS Safari will happily serve BOTH the shell and
+# its bundle from disk without touching the network, so a preview can silently keep serving code
+# from days ago while the tester swears they reloaded. (This cost a real debugging round on studiq.)
+# Hashed build assets stay cacheable: their names change when their contents do.
+#
+# The matcher is deliberately project-agnostic: anything WITHOUT a file extension is a shell request
+# (`/`, and every SPA deep link that try_files rewrites to index.html), plus *.html itself. Every
+# build asset has an extension, so nothing that should be cached is caught by this.
+# `$indent` is the leading tab depth, so this composes inside a `handle { … }` block too.
+_pv_render_nocache() {
+  local indent=$1
+  printf '%s@spa_shell {\n%s\tnot path_regexp \\.[A-Za-z0-9]+$\n%s}\n' "$indent" "$indent" "$indent"
+  printf '%sheader @spa_shell Cache-Control "no-store, must-revalidate"\n' "$indent"
+  printf '%s@spa_html path *.html\n' "$indent"
+  printf '%sheader @spa_html Cache-Control "no-store, must-revalidate"\n' "$indent"
+}
+
 # Render one dispatcher vhost: every preview listens on the dispatcher port and is keyed
 # by Host; cloudflared forwards the original Host, so Caddy multiplexes by it.
 _pv_render_vhost() {
@@ -191,10 +209,13 @@ _pv_render_vhost() {
     proxy)
       printf '\treverse_proxy 127.0.0.1:%s\n' "$port" ;;
     static)
+      _pv_render_nocache $'\t'
       printf '\troot * %s/%s\n\ttry_files {path} /index.html\n\tfile_server\n' "$wt" "$root" ;;
     static_proxy | *)
       printf '\thandle %s/* {\n\t\treverse_proxy 127.0.0.1:%s\n\t}\n' "$api" "$port"
-      printf '\thandle {\n\t\troot * %s/%s\n\t\ttry_files {path} /index.html\n\t\tfile_server\n\t}\n' "$wt" "$root" ;;
+      printf '\thandle {\n'
+      _pv_render_nocache $'\t\t'
+      printf '\t\troot * %s/%s\n\t\ttry_files {path} /index.html\n\t\tfile_server\n\t}\n' "$wt" "$root" ;;
   esac
   printf '}\n'
 }
