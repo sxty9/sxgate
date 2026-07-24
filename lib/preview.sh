@@ -454,6 +454,55 @@ _pv_cmd_ls() {
   return 0
 }
 
+# ── teardown (called by top-level `sxgate teardown`) ──────────────────────────────
+# The preview subsystem owns artifacts OUTSIDE /etc/sxgate (systemd units, the libexec
+# launcher, the worktree root, a system user). Only this file knows those paths, so the
+# removal lives here (single source of truth) and the core teardown just calls it.
+
+# Emit one human line per preview artifact that currently exists (for `--dry-run`).
+_pv_teardown_plan() {
+  local m
+  for m in "$PREVIEW_ETC"/instances/*.meta; do
+    [ -e "$m" ] || continue
+    printf '  systemd unit  sxgate-preview@%s\n' "$(basename "${m%.meta}")"
+  done
+  [ -e "$PREVIEW_SYSTEMD_DIR/sxgate-preview-proxy.service" ] && printf '  systemd unit  sxgate-preview-proxy\n'
+  [ -e "$PREVIEW_SYSTEMD_DIR/sxgate-preview@.service" ]      && printf '  systemd unit  sxgate-preview@ (template)\n'
+  [ -d "$PREVIEW_ETC" ]                 && printf '  dir           %s\n' "$PREVIEW_ETC"
+  [ -d "$PREVIEW_ROOT" ]                && printf '  dir           %s  (worktrees + build state)\n' "$PREVIEW_ROOT"
+  [ -e "$PREVIEW_LIBEXEC/preview-run" ] && printf '  file          %s\n' "$PREVIEW_LIBEXEC/preview-run"
+  if [ "$(id -u)" -eq 0 ] && id "$PREVIEW_USER" >/dev/null 2>&1; then
+    printf '  system user   %s\n' "$PREVIEW_USER"
+  fi
+  return 0
+}
+
+# Actually remove every preview artifact. Idempotent + best-effort (never aborts teardown).
+_pv_teardown() {
+  local m slug have_systemd=0
+  command -v systemctl >/dev/null 2>&1 && have_systemd=1
+  # Stop + disable each live instance, then the dispatcher.
+  for m in "$PREVIEW_ETC"/instances/*.meta; do
+    [ -e "$m" ] || continue
+    slug=$(basename "${m%.meta}")
+    [ "$have_systemd" = 1 ] && systemctl disable --now "sxgate-preview@$slug" >/dev/null 2>&1 || true
+  done
+  [ "$have_systemd" = 1 ] && systemctl disable --now sxgate-preview-proxy >/dev/null 2>&1 || true
+  # Remove the unit files, then reload the manager.
+  rm -f "$PREVIEW_SYSTEMD_DIR/sxgate-preview-proxy.service" \
+        "$PREVIEW_SYSTEMD_DIR/sxgate-preview@.service" 2>/dev/null || true
+  [ "$have_systemd" = 1 ] && systemctl daemon-reload >/dev/null 2>&1 || true
+  # Remove on-disk state (dirs guarded with :? so an unset var can never rm -rf /).
+  rm -rf "${PREVIEW_ETC:?}" "${PREVIEW_ROOT:?}" 2>/dev/null || true
+  rm -f "$PREVIEW_LIBEXEC/preview-run" 2>/dev/null || true
+  rmdir "$PREVIEW_LIBEXEC" 2>/dev/null || true   # only if now empty
+  # Drop the unprivileged system user (root only; best-effort).
+  if [ "$(id -u)" -eq 0 ] && command -v userdel >/dev/null 2>&1 && id "$PREVIEW_USER" >/dev/null 2>&1; then
+    userdel "$PREVIEW_USER" >/dev/null 2>&1 || warn "could not remove system user '$PREVIEW_USER'"
+  fi
+  return 0
+}
+
 # ── dispatch ────────────────────────────────────────────────────────────────────
 _pv_usage() {
   cat <<EOF
