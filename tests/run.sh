@@ -94,6 +94,12 @@ case "$1 $2" in
     echo "Created tunnel $3 with id mock-tunnel-id"
     exit 0
     ;;
+  "tunnel delete")
+    # Record that a delete was requested (HOME is isolated to the test's $TMP).
+    : > "$HOME/tunnel-deleted-marker" 2>/dev/null || true
+    echo "Deleted tunnel $3"
+    exit 0
+    ;;
   "tunnel login")
     echo "logged in"
     exit 0
@@ -554,6 +560,69 @@ test_preview_down() {
   [ ! -d "$PREVIEW_ROOT/$slug" ] && ok "worktree dir removed" || fail "worktree dir removed" "present"
 }
 
+# ── teardown tests ──────────────────────────────────────────────────────────────
+
+# Populate a full sxgate install: state files + preview subsystem + one live preview.
+seed_full_install() {
+  local repo; repo=$(make_service_repo proxy)
+  write_empty_config
+  cat > "$SXGATE_CONF" <<EOF
+TUNNEL_NAME=sxgate
+MANAGED_ZONE=test.example
+CONFIG_FILE=$CONFIG_FILE
+EOF
+  "$SXGATE" service add blog http://localhost:2368 >/dev/null 2>&1
+  "$SXGATE" preview setup >/dev/null 2>&1
+  "$SXGATE" preview up --repo "$repo" feat/x >/dev/null 2>&1
+}
+
+test_teardown_dry_run_changes_nothing() {
+  seed_full_install
+  out=$(SXGATE_QUIET=0 "$SXGATE" teardown --dry-run 2>&1) || fail "dry-run runs" "nonzero exit"
+  assert_contains "$out" "WILL REMOVE" "dry-run prints removal plan"
+  assert_contains "$out" "KEPT (residual" "dry-run prints residual-data policy"
+  assert_contains "$out" "dry run" "dry-run says it changed nothing"
+  assert_contains "$out" "cannot delete DNS" "residual policy names DNS records"
+  assert_contains "$out" "cert.pem" "residual policy names the account login cert"
+  assert_contains "$out" "--purge-tunnel" "default plan points at --purge-tunnel to remove the tunnel"
+  # Nothing was actually removed.
+  assert_file_exists "$CONFIG_FILE" "dry-run keeps config.yml"
+  assert_file_exists "$SXGATE_CONF" "dry-run keeps sxgate.conf"
+  assert_file_exists "$PREVIEW_ETC/Caddyfile" "dry-run keeps preview dispatcher"
+  assert_file_exists "$PREVIEW_ROOT/feat-x-demo/repo" "dry-run keeps preview worktree"
+}
+
+test_teardown_default_removes_state_keeps_tunnel() {
+  seed_full_install
+  rm -f "$HOME/tunnel-deleted-marker"
+  "$SXGATE" teardown --yes >/dev/null 2>&1 || fail "teardown runs" "nonzero exit"
+  # sxgate's own footprint is gone…
+  [ ! -e "$CONFIG_FILE" ]   && ok "config.yml removed"        || fail "config.yml removed" "present"
+  [ ! -e "$SXGATE_CONF" ]   && ok "sxgate.conf removed"       || fail "sxgate.conf removed" "present"
+  [ ! -e "$SERVICES_FILE" ] && ok "services file removed"     || fail "services file removed" "present"
+  [ ! -d "$BACKUP_DIR" ]    && ok "backups dir removed"       || fail "backups dir removed" "present"
+  # …including the whole preview subsystem…
+  [ ! -d "$PREVIEW_ETC" ]   && ok "preview etc removed"       || fail "preview etc removed" "present"
+  [ ! -d "$PREVIEW_ROOT" ]  && ok "preview worktrees removed" || fail "preview worktrees removed" "present"
+  [ ! -e "$PREVIEW_LIBEXEC/preview-run" ] && ok "preview launcher removed" || fail "preview launcher removed" "present"
+  [ ! -e "$PREVIEW_SYSTEMD_DIR/sxgate-preview-proxy.service" ] && ok "dispatcher unit removed" || fail "dispatcher unit removed" "present"
+  [ ! -e "$PREVIEW_SYSTEMD_DIR/sxgate-preview@.service" ] && ok "instance unit removed" || fail "instance unit removed" "present"
+  # …but the external Cloudflare tunnel is deliberately KEPT by default.
+  [ ! -e "$HOME/tunnel-deleted-marker" ] && ok "default keeps the tunnel (no delete)" || fail "default keeps the tunnel" "tunnel was deleted"
+}
+
+test_teardown_purge_tunnel_deletes_tunnel_and_creds() {
+  seed_full_install
+  rm -f "$HOME/tunnel-deleted-marker"
+  # Pre-place tunnel credentials where teardown --purge-tunnel expects them (~/.cloudflared).
+  mkdir -p "$HOME/.cloudflared"
+  : > "$HOME/.cloudflared/mock-tunnel-id.json"
+  "$SXGATE" teardown --purge-tunnel --yes >/dev/null 2>&1 || fail "purge teardown runs" "nonzero exit"
+  assert_file_exists "$HOME/tunnel-deleted-marker" "--purge-tunnel calls 'cloudflared tunnel delete'"
+  [ ! -e "$HOME/.cloudflared/mock-tunnel-id.json" ] && ok "--purge-tunnel removes tunnel credentials" || fail "--purge-tunnel removes credentials" "present"
+  [ ! -e "$SXGATE_CONF" ] && ok "purge also removes sxgate state" || fail "purge removes state" "present"
+}
+
 # ── run all ───────────────────────────────────────────────────────────────────
 TESTS=(
   test_help_and_version
@@ -583,6 +652,9 @@ TESTS=(
   test_preview_up_requires_setup
   test_preview_port_allocation
   test_preview_down
+  test_teardown_dry_run_changes_nothing
+  test_teardown_default_removes_state_keeps_tunnel
+  test_teardown_purge_tunnel_deletes_tunnel_and_creds
 )
 
 # Allow running a single test by name

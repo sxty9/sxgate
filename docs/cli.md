@@ -82,6 +82,23 @@ Validiert die config.yml und reloaded den cloudflared-Dienst. Hilfreich nach man
 
 Tunnel-Info + systemd-Status.
 
+### `sxgate teardown [--purge-tunnel] [--dry-run] [--yes]`
+
+Die **Umkehrung von `setup`** — entfernt alles, was sxgate auf der Maschine installiert hat, an **einer** Stelle (kein verstreutes manuelles `rm`/`systemctl`/`cloudflared`). Vor dem Löschen druckt der Befehl **explizit**, was entfernt und was bewusst behalten wird (Residual-Data-Policy):
+
+- **Standard:** entfernt sxgate-State (`sxgate.conf`, `services`, `backups/`), das komplette Preview-Subsystem (Units, Dispatcher, Worktrees, Launcher, System-User) und die von sxgate verwaltete `config.yml`; stoppt `cloudflared` (die systemd-Unit bleibt installiert). **Behalten:** der Cloudflare-Tunnel samt Credentials, die DNS-Records, das `cloudflared`-Paket und `cert.pem`.
+- **`--purge-tunnel`:** löscht zusätzlich den Cloudflare-Tunnel (`cloudflared tunnel delete`) + dessen Credentials und disabled den `cloudflared`-Dienst.
+- **`--dry-run`:** zeigt exakt diesen Plan und ändert **nichts**.
+- **`--yes`:** überspringt die Rückfrage (oder `SXGATE_YES=1`).
+
+DNS-Records kann `cloudflared` per CLI **nicht** löschen — sie werden in **beiden** Modi als Residual gemeldet und im Cloudflare-Dashboard manuell entfernt (identisch zu `route rm --purge-dns`). Destruktiv → verlangt Bestätigung; `teardown` selbst braucht root (wie `setup`).
+
+```bash
+sudo sxgate teardown --dry-run        # Plan ansehen, nichts anfassen
+sudo sxgate teardown                  # sxgate entfernen, Tunnel + DNS behalten
+sudo sxgate teardown --purge-tunnel   # zusätzlich den Cloudflare-Tunnel löschen
+```
+
 ## Preview-Sandboxes (`sxgate preview`)
 
 Pro-Branch-Sandboxes für **jeden** über sxgate gehosteten Service — Feature-Testing auf einer
@@ -214,4 +231,4 @@ Der SSH-Endpoint ist jetzt über den öffentlichen Hostnamen erreichbar (geschü
 
 **Wie kann ich den Tunnel-Namen ändern?** Ändere `TUNNEL_NAME` in `/etc/sxgate/sxgate.conf` und passe `tunnel:` in `config.yml` an (oder `sxgate init --tunnel <neu>` neu laufen lassen).
 
-**Wie deinstalliere ich?** `sudo rm /usr/local/bin/sxgate /etc/sxgate -rf` — die `config.yml` bleibt unangetastet.
+**Wie deinstalliere ich?** `sudo sxgate teardown` — entfernt sxgate-State, das Preview-Subsystem und die verwaltete `config.yml` gebündelt und meldet **explizit**, was bewusst bleibt (Cloudflare-Tunnel + Credentials, DNS-Records, `cert.pem`, `cloudflared`-Paket). `sudo sxgate teardown --purge-tunnel` löscht zusätzlich Tunnel + Credentials; `--dry-run` zeigt den Plan, ohne etwas zu ändern. Danach ggf. nur noch das repo-lokale `./sxgate`-Skript wegräumen. (Das alte `rm -rf /etc/sxgate` ließ Tunnel, systemd-Units, DNS-Records und Preview-Instanzen verwaist zurück — `teardown` schließt das.)
