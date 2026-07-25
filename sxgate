@@ -853,6 +853,121 @@ cmd_status() {
   fi
 }
 
+# ── teardown (sxgate teardown) — the inverse of `setup`, bundled in one place ──
+# Removes everything sxgate installed on this machine and prints an explicit residual-data
+# policy: exactly what is deleted and what is deliberately kept (and how to handle it).
+# This is the single access point for "delete sxgate" — no scattered manual rm/systemctl steps.
+cmd_teardown() {
+  local dry=0 purge_tunnel=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run|-n)   dry=1; shift ;;
+      --purge-tunnel) purge_tunnel=1; shift ;;
+      --yes|-y)       SXGATE_YES=1; shift ;;
+      -h|--help) cat <<EOF; return 0 ;;
+Usage: sxgate teardown [--purge-tunnel] [--dry-run] [--yes]
+
+Remove everything sxgate installed on this machine — in one place. Prints exactly
+what is removed and what is deliberately KEPT (residual data) before touching anything.
+
+  (default)        remove sxgate state (conf, services, backups), the preview
+                   subsystem, and the sxgate-managed cloudflared routing config;
+                   stop cloudflared (its systemd unit is kept installed).
+                   The Cloudflare tunnel, its credentials and DNS records are KEPT.
+  --purge-tunnel   additionally delete the Cloudflare tunnel + its credentials and
+                   disable the cloudflared service.
+  --dry-run        show the plan and change nothing.
+  --yes            skip the confirmation prompt (or set SXGATE_YES=1).
+
+Note: cloudflared cannot delete DNS records via the CLI — those are always left for
+manual removal in the Cloudflare dashboard, and reported as residual either way.
+EOF
+      *) die "unknown flag: $1" 2 ;;
+    esac
+  done
+  [ "$dry" = 1 ] || needs_root "teardown" $([ $purge_tunnel -eq 1 ] && printf -- '--purge-tunnel')
+  load_conf
+  # Best-effort tunnel identity for the report (may be offline / unauthenticated).
+  local tid=""
+  command -v cloudflared >/dev/null 2>&1 && tid=$(get_tunnel_id 2>/dev/null || true)
+
+  _teardown_report "$purge_tunnel" "$tid"
+
+  if [ "$dry" = 1 ]; then
+    log ""
+    log "(dry run — nothing was changed)"
+    return 0
+  fi
+  local prompt="Proceed with teardown?"
+  [ "$purge_tunnel" = 1 ] && prompt="Proceed with teardown INCLUDING deleting the Cloudflare tunnel?"
+  log ""
+  confirm "$prompt" || die "aborted" 10
+  with_lock _teardown_locked "$purge_tunnel" "$tid"
+  log ""
+  log "teardown complete. Residual items above (DNS records, cert.pem) are left as noted."
+}
+
+# Print the two-part plan: what gets removed, and what is kept (residual) with handling notes.
+_teardown_report() {
+  local purge_tunnel=$1 tid=$2
+  log "── sxgate teardown $SXGATE_VERSION ──"
+  log ""
+  log "WILL REMOVE:"
+  if command -v _pv_teardown_plan >/dev/null 2>&1; then
+    local pvplan; pvplan=$(_pv_teardown_plan)
+    [ -n "$pvplan" ] && printf '%s\n' "$pvplan"
+  fi
+  [ -e "$CONFIG_FILE" ]    && log "  file          $CONFIG_FILE  (cloudflared routing — sxgate-managed)"
+  [ -e "$SXGATE_CONF" ]    && log "  file          $SXGATE_CONF"
+  [ -e "$SERVICES_FILE" ]  && log "  file          $SERVICES_FILE"
+  [ -d "$BACKUP_DIR" ]     && log "  dir           $BACKUP_DIR  (config backups)"
+  if command -v cloudflared >/dev/null 2>&1; then
+    if [ "$purge_tunnel" = 1 ]; then
+      log "  cloudflared   service disabled + tunnel '$TUNNEL_NAME'${tid:+ ($tid)} deleted"
+      [ -n "$tid" ] && log "  file          ~/.cloudflared/$tid.json  (tunnel credentials)"
+    else
+      log "  cloudflared   service stopped (systemd unit kept installed)"
+    fi
+  fi
+  log ""
+  log "KEPT (residual data — handled as noted):"
+  if [ "$purge_tunnel" != 1 ]; then
+    log "  Cloudflare tunnel   '$TUNNEL_NAME'${tid:+ ($tid)} + credentials — external resource, reusable."
+    log "                      delete it too with:  sxgate teardown --purge-tunnel"
+  fi
+  log "  DNS records         in zone '${MANAGED_ZONE:-<unset>}' — cloudflared cannot delete DNS via the CLI;"
+  log "                      remove manually at https://dash.cloudflare.com/ → DNS."
+  log "  cloudflared binary  system apt package — remove with:  apt-get remove cloudflared"
+  log "  Cloudflare login    ~/.cloudflared/cert.pem — account-level login; delete manually if desired."
+}
+
+_teardown_locked() {
+  local purge_tunnel=$1 tid=$2
+  # 1. Preview subsystem (units, libexec, worktrees, system user) — owns paths outside /etc/sxgate.
+  command -v _pv_teardown >/dev/null 2>&1 && _pv_teardown
+  # 2. cloudflared: stop by default, fully disable + delete the tunnel under --purge-tunnel.
+  if command -v systemctl >/dev/null 2>&1; then
+    if [ "$purge_tunnel" = 1 ]; then
+      systemctl disable --now cloudflared >/dev/null 2>&1 || true
+    else
+      systemctl stop cloudflared >/dev/null 2>&1 || true
+    fi
+  fi
+  if [ "$purge_tunnel" = 1 ] && command -v cloudflared >/dev/null 2>&1; then
+    cloudflared tunnel delete "$TUNNEL_NAME" >/dev/null 2>&1 \
+      || warn "could not delete tunnel '$TUNNEL_NAME' (active connections? already gone?) — check 'cloudflared tunnel list'"
+    if [ -n "$tid" ]; then
+      rm -f "/root/.cloudflared/$tid.json" "$HOME/.cloudflared/$tid.json" 2>/dev/null || true
+    fi
+  fi
+  # 3. sxgate's own state + the routing config it manages (removed individually — never a
+  #    parent dir, so overridden test/state paths can't take unrelated files with them).
+  rm -f "$CONFIG_FILE" "$SERVICES_FILE" "$SXGATE_CONF" "$LOCK_FILE" 2>/dev/null || true
+  [ -n "${BACKUP_DIR:-}" ] && rm -rf "${BACKUP_DIR:?}" 2>/dev/null || true
+  rmdir "$(dirname "$SXGATE_CONF")" 2>/dev/null || true   # only if /etc/sxgate is now empty
+  log "removed: sxgate state, preview subsystem, cloudflared routing config"
+}
+
 cmd_help() {
   cat <<EOF
 sxgate $SXGATE_VERSION — manage subdomain↔service routing for a Cloudflare Tunnel.
@@ -872,6 +987,7 @@ Usage:
   sxgate mail setup|relay|dkim-record|test-inbound|status   public mail edge for maild
   sxgate apply [--restart]
   sxgate status
+  sxgate teardown [--purge-tunnel] [--dry-run] [--yes]   inverse of setup; bundled removal + residual-data report
   sxgate init [--zone <domain>] [--tunnel <name>] [--config <path>]   # low-level scaffold
   sxgate --version | --help
 
@@ -911,6 +1027,7 @@ main() {
     mail)        command -v cmd_mail >/dev/null 2>&1 || die "mail edge not installed (lib/mail.sh missing)" 5; cmd_mail "$@" ;;
     apply)       cmd_apply "$@" ;;
     status)      cmd_status "$@" ;;
+    teardown)    cmd_teardown "$@" ;;
     --version|-v|version) echo "sxgate $SXGATE_VERSION" ;;
     -h|--help|help) cmd_help ;;
     *) die "unknown command: $cmd (run 'sxgate --help')" 2 ;;

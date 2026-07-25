@@ -86,6 +86,7 @@ sudo ./sxgate service add blog http://localhost:2368
 sudo ./sxgate route   add blog.henrysoase.org blog
 sudo ./sxgate route   ls
 sudo ./sxgate status
+sudo ./sxgate teardown --dry-run             # Umkehrung von setup: zeigt, was entfernt/behalten wird
 ```
 
 Tests laufen offline (mocken `cloudflared` und `systemctl`):
