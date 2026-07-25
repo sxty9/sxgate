@@ -623,8 +623,52 @@ test_teardown_purge_tunnel_deletes_tunnel_and_creds() {
   [ ! -e "$SXGATE_CONF" ] && ok "purge also removes sxgate state" || fail "purge removes state" "present"
 }
 
+# ── data-integrity axioms (passive storage · atomic access) ─────────────────────
+
+test_conf_is_passive_data() {
+  # Passive-Speicher: sxgate.conf is a data pool — it must be PARSED, never executed.
+  write_empty_config
+  local sentinel="$TMP/conf-was-executed"
+  # A conf laced with shell side-effects (a bare command + a command-substitution
+  # value) plus noise. If sxgate SOURCED the file, $sentinel would be created.
+  cat > "$SXGATE_CONF" <<EOF
+# managed by sxgate; safe to edit
+TUNNEL_NAME=sxgate
+touch $sentinel
+MANAGED_ZONE=\$(touch $sentinel)
+UNKNOWN_KEY=ignored
+CONFIG_FILE=$CONFIG_FILE
+EOF
+  # A later line wins — a clean, quoted value also proves quote-stripping on read.
+  printf 'MANAGED_ZONE="test.example"\n' >> "$SXGATE_CONF"
+
+  local out; out=$("$SXGATE" zone 2>&1)
+  [ ! -e "$sentinel" ] && ok "conf parsed passively — no embedded command executed" \
+    || fail "conf is passive" "a command inside sxgate.conf was executed (pool is not passive)"
+  assert_contains "$out" "test.example" "whitelisted key parsed, surrounding quotes stripped"
+}
+
+test_axioms_data_integrity_source_invariants() {
+  # Executable guards so the two axioms can't silently regress.
+  local lib="$SCRIPT_DIR/../lib/preview.sh"
+  # Atomare Zugriffe: the live config is never the destination of a (non-atomic) cp.
+  if grep -nE 'cp .*"\$CONFIG_FILE"[[:space:]]*([;}]|$)' "$SXGATE" "$lib" >/dev/null; then
+    fail "config written atomically" "a cp writes onto \$CONFIG_FILE (non-atomic pool write)"
+  else
+    ok "live config is only ever written atomically (no cp onto it)"
+  fi
+  # Passive Speicher: the conf pool is parsed, never sourced/executed.
+  if grep -nE '(^|[^[:alnum:]_])(\.|source) +"\$SXGATE_CONF"' "$SXGATE" >/dev/null; then
+    fail "conf is passive" "sxgate.conf is still sourced (pool executes logic)"
+  else
+    ok "sxgate.conf is parsed, never sourced (passive data pool)"
+  fi
+}
+
 # ── run all ───────────────────────────────────────────────────────────────────
 TESTS=(
+  test_conf_is_passive_data
+  test_axioms_data_integrity_source_invariants
   test_help_and_version
   test_setup_bootstraps
   test_zone_set_and_show
