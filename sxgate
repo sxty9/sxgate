@@ -51,11 +51,31 @@ needs_root() {
 }
 
 # ── conf loading ──────────────────────────────────────────────────────────────
+# The conf is a passive data pool: a plain KEY=value store. We PARSE the whitelisted
+# keys instead of sourcing the file, so the pool holds data and can never execute its
+# own logic (Passive-Speicher axiom). Evaluation lives here, outside the pool.
 load_conf() {
-  if [ -r "$SXGATE_CONF" ]; then
-    # shellcheck disable=SC1090
-    . "$SXGATE_CONF"
-  fi
+  [ -r "$SXGATE_CONF" ] || return 0
+  local line key val
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line#"${line%%[![:space:]]*}"}     # strip leading whitespace
+    case "$line" in
+      ''|'#'*)   continue ;;                   # blank / comment
+      export\ *) line=${line#export } ;;       # tolerate an 'export ' prefix
+    esac
+    case "$line" in *=*) ;; *) continue ;; esac
+    key=${line%%=*}
+    val=${line#*=}
+    case "$key" in
+      TUNNEL_NAME|MANAGED_ZONE|CONFIG_FILE) ;; # the only recognised keys
+      *) continue ;;
+    esac
+    case "$val" in                             # strip one layer of matching quotes
+      \"*\") val=${val#\"}; val=${val%\"} ;;
+      \'*\') val=${val#\'}; val=${val%\'} ;;
+    esac
+    printf -v "$key" '%s' "$val"               # assign by name; no eval, no exec
+  done < "$SXGATE_CONF"
 }
 
 # ── locking ───────────────────────────────────────────────────────────────────
@@ -106,14 +126,6 @@ backup_config() {
   printf '%s' "$target"
 }
 
-restore_backup() {
-  local newest
-  newest=$(ls -1t "$BACKUP_DIR"/config.yml.* 2>/dev/null | head -n1 || true)
-  [ -n "$newest" ] || die "no backup available to restore" 5
-  cp -a "$newest" "$CONFIG_FILE"
-  warn "restored $CONFIG_FILE from $newest"
-}
-
 # ── validation ────────────────────────────────────────────────────────────────
 validate_service_name() {
   [[ "$1" =~ ^[a-z][a-z0-9-]{0,30}$ ]] \
@@ -144,15 +156,16 @@ svc_get() {
 }
 
 svc_set() {
-  local name=$1 url=$2 tmp
+  local name=$1 url=$2
   mkdir -p "$(dirname "$SERVICES_FILE")"
-  : > "${SERVICES_FILE}.tmp"
-  if [ -e "$SERVICES_FILE" ]; then
-    awk -F= -v n="$name" '$1!=n' "$SERVICES_FILE" > "${SERVICES_FILE}.tmp"
-  fi
-  printf '%s=%s\n' "$name" "$url" >> "${SERVICES_FILE}.tmp"
-  atomic_write "$SERVICES_FILE" < "${SERVICES_FILE}.tmp"
-  rm -f "${SERVICES_FILE}.tmp"
+  # Stream the rewritten table straight into a single atomic write — no scratch file,
+  # no observable intermediate state.
+  {
+    if [ -e "$SERVICES_FILE" ]; then
+      awk -F= -v n="$name" '$1!=n' "$SERVICES_FILE"
+    fi
+    printf '%s=%s\n' "$name" "$url"
+  } | atomic_write "$SERVICES_FILE"
 }
 
 svc_rm() {
@@ -274,7 +287,7 @@ route_upsert() {
   # Validate; rollback on failure
   if ! cloudflared tunnel ingress validate "$CONFIG_FILE" >/dev/null 2>&1; then
     if [ -n "${backup:-}" ]; then
-      cp -a "$backup" "$CONFIG_FILE"
+      atomic_write "$CONFIG_FILE" < "$backup"   # atomic rollback — no half-written pool
       die "cloudflared rejected the new config; rolled back" 4
     fi
     die "cloudflared rejected the new config (no backup to roll back to)" 4
@@ -299,7 +312,7 @@ route_remove() {
   rm -rf "$d"
   if ! cloudflared tunnel ingress validate "$CONFIG_FILE" >/dev/null 2>&1; then
     if [ -n "${backup:-}" ]; then
-      cp -a "$backup" "$CONFIG_FILE"
+      atomic_write "$CONFIG_FILE" < "$backup"   # atomic rollback — no half-written pool
       die "cloudflared rejected the new config; rolled back" 4
     fi
     die "cloudflared rejected the new config" 4
@@ -436,7 +449,7 @@ EOF
 
   # Preserve an already-set zone; setup itself does NOT take a zone.
   local zone=""
-  [ -r "$SXGATE_CONF" ] && { . "$SXGATE_CONF"; zone=${MANAGED_ZONE:-}; }
+  [ -r "$SXGATE_CONF" ] && { load_conf; zone=${MANAGED_ZONE:-}; }
   with_lock _setup_scaffold "$tid" "$creds" "$zone"
 
   ensure_service
@@ -450,27 +463,23 @@ EOF
 _setup_scaffold() {
   local tid=$1 creds=$2 zone=$3
   mkdir -p "$(dirname "$SXGATE_CONF")" "$(dirname "$SERVICES_FILE")" "$BACKUP_DIR" "$(dirname "$CONFIG_FILE")"
-  cat > "${SXGATE_CONF}.tmp.$$" <<EOF
+  atomic_write "$SXGATE_CONF" <<EOF
 # /etc/sxgate/sxgate.conf — managed by sxgate; safe to edit
 TUNNEL_NAME=$TUNNEL_NAME
 MANAGED_ZONE=$zone
 CONFIG_FILE=$CONFIG_FILE
 EOF
-  atomic_write "$SXGATE_CONF" < "${SXGATE_CONF}.tmp.$$"
-  rm -f "${SXGATE_CONF}.tmp.$$"
   [ -e "$SERVICES_FILE" ] || { : > "$SERVICES_FILE"; chmod 0644 "$SERVICES_FILE"; }
   if [ -e "$CONFIG_FILE" ]; then
     backup_config >/dev/null
     log "existing $CONFIG_FILE preserved (backup taken)"
   else
-    cat > "${CONFIG_FILE}.tmp.$$" <<EOF
+    atomic_write "$CONFIG_FILE" <<EOF
 tunnel: $tid
 credentials-file: $creds
 ingress:
   - service: http_status:404
 EOF
-    atomic_write "$CONFIG_FILE" < "${CONFIG_FILE}.tmp.$$"
-    rm -f "${CONFIG_FILE}.tmp.$$"
     log "scaffolded $CONFIG_FILE"
   fi
 }
@@ -494,15 +503,12 @@ cmd_zone() {
 _zone_set_locked() {
   local zone=$1
   : "${TUNNEL_NAME:=sxgate}" "${CONFIG_FILE:=/etc/cloudflared/config.yml}"
-  mkdir -p "$(dirname "$SXGATE_CONF")"
-  cat > "${SXGATE_CONF}.tmp.$$" <<EOF
+  atomic_write "$SXGATE_CONF" <<EOF
 # /etc/sxgate/sxgate.conf — managed by sxgate; safe to edit
 TUNNEL_NAME=$TUNNEL_NAME
 MANAGED_ZONE=$zone
 CONFIG_FILE=$CONFIG_FILE
 EOF
-  atomic_write "$SXGATE_CONF" < "${SXGATE_CONF}.tmp.$$"
-  rm -f "${SXGATE_CONF}.tmp.$$"
   log "zone set: $zone"
 }
 
@@ -548,8 +554,7 @@ EOF
 
   # Zone: flag wins; else keep existing; else require it.
   if [ -z "$zone" ] && [ -r "$SXGATE_CONF" ]; then
-    # shellcheck disable=SC1090
-    . "$SXGATE_CONF"
+    load_conf
     zone=$MANAGED_ZONE
   fi
   if [ -z "$zone" ] && [ -e "$CONFIG_FILE" ]; then
@@ -567,14 +572,12 @@ EOF
   fi
   # Zone is optional — `sxgate zone <domain>` can set it later; route add enforces it.
 
-  cat > "${SXGATE_CONF}.tmp.$$" <<EOF
+  atomic_write "$SXGATE_CONF" <<EOF
 # /etc/sxgate/sxgate.conf — managed by sxgate; safe to edit
 TUNNEL_NAME=$TUNNEL_NAME
 MANAGED_ZONE=$zone
 CONFIG_FILE=$CONFIG_FILE
 EOF
-  atomic_write "$SXGATE_CONF" < "${SXGATE_CONF}.tmp.$$"
-  rm -f "${SXGATE_CONF}.tmp.$$"
   log "wrote $SXGATE_CONF (zone=$zone)"
 
   [ -e "$SERVICES_FILE" ] || { : > "$SERVICES_FILE"; chmod 0644 "$SERVICES_FILE"; log "created $SERVICES_FILE"; }
@@ -583,14 +586,12 @@ EOF
     backup_config >/dev/null
     log "existing $CONFIG_FILE preserved (backup taken)"
   else
-    cat > "${CONFIG_FILE}.tmp.$$" <<EOF
+    atomic_write "$CONFIG_FILE" <<EOF
 tunnel: $tid
 credentials-file: $creds
 ingress:
   - service: http_status:404
 EOF
-    atomic_write "$CONFIG_FILE" < "${CONFIG_FILE}.tmp.$$"
-    rm -f "${CONFIG_FILE}.tmp.$$"
     log "scaffolded $CONFIG_FILE"
   fi
 

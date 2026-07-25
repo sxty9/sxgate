@@ -329,7 +329,7 @@ _pv_ensure_wildcard() {
   yaml_emit "$d" | atomic_write "$CONFIG_FILE"
   rm -rf "$d"
   if command -v cloudflared >/dev/null 2>&1 && ! cloudflared tunnel ingress validate "$CONFIG_FILE" >/dev/null 2>&1; then
-    [ -n "${backup:-}" ] && { cp -a "$backup" "$CONFIG_FILE"; die "cloudflared rejected the wildcard ingress; rolled back" 4; }
+    [ -n "${backup:-}" ] && { atomic_write "$CONFIG_FILE" < "$backup"; die "cloudflared rejected the wildcard ingress; rolled back" 4; }
     die "cloudflared rejected the wildcard ingress" 4
   fi
   reload_cloudflared reload 2>/dev/null || warn "reload cloudflared manually (systemctl reload cloudflared)"
