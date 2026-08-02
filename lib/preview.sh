@@ -163,7 +163,7 @@ _pv_alloc_port() {
   return 1
 }
 
-_pv_meta_get() { grep -m1 "^$2=" "$PREVIEW_ETC/instances/$1.meta" 2>/dev/null | cut -d= -f2-; }
+_pv_meta_get() { kv_get "$PREVIEW_ETC/instances/$1.meta" "$2"; }   # shared core KEY=value reader
 
 # Resolve a user-given slug-or-branch to a concrete slug (unique branch match allowed).
 _pv_resolve_slug() {
@@ -234,13 +234,7 @@ _pv_reload_dispatcher() {
 }
 
 # ── setup (one-time) ────────────────────────────────────────────────────────────
-_pv_ensure_user() {
-  [ "$(id -u)" -eq 0 ] || return 0
-  command -v useradd >/dev/null 2>&1 || return 0
-  id "$PREVIEW_USER" >/dev/null 2>&1 && return 0
-  useradd --system --no-create-home --shell /usr/sbin/nologin "$PREVIEW_USER" 2>/dev/null \
-    || warn "could not create system user '$PREVIEW_USER'"
-}
+_pv_ensure_user() { ensure_system_user "$PREVIEW_USER"; }   # shared core helper (Reuse-before-Build)
 
 _pv_write_launcher() {
   mkdir -p "$PREVIEW_LIBEXEC"
@@ -607,8 +601,12 @@ _pv_write_instance_env() {
     fi
   } | atomic_write "$PREVIEW_ETC/instances/$slug.env"
   # fix #6: the env can carry RUN_ENV values — keep it out of world-read. systemd reads it as
-  # root before dropping to User=, so it need not be user-readable.
-  [ -n "$PREVIEW_RUNAS" ] && chmod 0640 "$PREVIEW_ETC/instances/$slug.env" 2>/dev/null
+  # root before dropping to User=, so it need not be user-readable. (Guarded with an explicit
+  # `if`/`|| true` so this trailing best-effort chmod can never become the writer's non-zero
+  # return and abort `preview up` under `set -e` on the operator path — cf. _pv_chown.)
+  if [ -n "$PREVIEW_RUNAS" ]; then
+    chmod 0640 "$PREVIEW_ETC/instances/$slug.env" 2>/dev/null || true
+  fi
 }
 
 _pv_write_meta() {
@@ -621,12 +619,18 @@ _pv_write_meta() {
     printf 'HOST=%s\n' "$6"
     printf 'MODE=%s\n' "$7"
     # Root-written ownership record — the authoritative guard for down/rebuild (a user can't forge
-    # it; instances/ is root-only). Present only for per-user previews.
-    [ -n "$PREVIEW_RUNAS" ] && printf 'OWNER=%s\n' "$PREVIEW_RUNAS"
+    # it; instances/ is root-only). Present only for per-user previews. (An `if` — not a trailing
+    # `&&` — so a false guard can't make this the block's non-zero exit and, under `pipefail`, sink
+    # the whole `| atomic_write` pipeline and abort `preview up` on the operator path.)
+    if [ -n "$PREVIEW_RUNAS" ]; then printf 'OWNER=%s\n' "$PREVIEW_RUNAS"; fi
   } | atomic_write "$PREVIEW_ETC/instances/$1.meta"
   # review #9: don't leak every user's OWNER/PORT/REPO/BRANCH world-readably. devlabd reads it via
-  # group devlab.
-  [ -n "$PREVIEW_RUNAS" ] && { chgrp devlab "$PREVIEW_ETC/instances/$1.meta" 2>/dev/null; chmod 0640 "$PREVIEW_ETC/instances/$1.meta" 2>/dev/null; }
+  # group devlab. (Guarded so this trailing best-effort tightening can't become the writer's
+  # non-zero return and abort `preview up` under `set -e` on the operator path — cf. _pv_chown.)
+  if [ -n "$PREVIEW_RUNAS" ]; then
+    chgrp devlab "$PREVIEW_ETC/instances/$1.meta" 2>/dev/null || true
+    chmod 0640 "$PREVIEW_ETC/instances/$1.meta" 2>/dev/null || true
+  fi
 }
 
 # ── rebuild / down / ls ───────────────────────────────────────────────────────

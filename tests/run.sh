@@ -506,12 +506,16 @@ test_preview_up_static_proxy() {
   "$SXGATE" preview setup >/dev/null 2>&1
   "$SXGATE" preview up --repo "$repo" feat/x >/dev/null 2>&1 || fail "preview up runs" "nonzero exit"
   local slug=feat-x-demo
+  # The backend port is allocated from the pool with already-bound ports skipped, so derive the
+  # one actually assigned rather than assuming the pool's first port — then assert the SAME port
+  # flows into both the vhost and the env (host-independent; cf. test_preview_port_allocation).
+  local port; port=$(grep -m1 '^PORT=' "$PREVIEW_ETC/instances/$slug.env" | cut -d= -f2)
   assert_file_exists "$PREVIEW_ROOT/$slug/repo/dist/index.html" "BUILD produced static output in the worktree"
   assert_file_contains "$PREVIEW_ETC/sites.d/$slug.caddy" "http://$slug.test.example:21490" "vhost keyed by host:dispatch-port"
-  assert_file_contains "$PREVIEW_ETC/sites.d/$slug.caddy" "reverse_proxy 127.0.0.1:8800" "api proxied to backend port"
+  assert_file_contains "$PREVIEW_ETC/sites.d/$slug.caddy" "reverse_proxy 127.0.0.1:$port" "api proxied to backend port"
   assert_file_contains "$PREVIEW_ETC/sites.d/$slug.caddy" "$PREVIEW_ROOT/$slug/repo/dist" "static root points into worktree"
-  assert_file_contains "$PREVIEW_ETC/instances/$slug.env" "PORT=8800" "port recorded"
-  assert_file_contains "$PREVIEW_ETC/instances/$slug.env" "--port 8800" "RUN expanded {port}"
+  assert_file_contains "$PREVIEW_ETC/instances/$slug.env" "PORT=$port" "port recorded"
+  assert_file_contains "$PREVIEW_ETC/instances/$slug.env" "--port $port" "RUN expanded {port}"
   assert_file_contains "$PREVIEW_ETC/instances/$slug.env" "STATE_DIR=$PREVIEW_ROOT/$slug/state" "RUN_ENV expanded {state}"
   assert_file_contains "$PREVIEW_ETC/instances/$slug.meta" "BRANCH=feat/x" "meta records branch"
   out=$("$SXGATE" preview ls)
@@ -525,7 +529,8 @@ test_preview_proxy_mode() {
   "$SXGATE" preview setup >/dev/null 2>&1
   "$SXGATE" preview up --repo "$repo" feat/x >/dev/null 2>&1 || fail "proxy up runs" "nonzero exit"
   local slug=feat-x-demo
-  assert_file_contains "$PREVIEW_ETC/sites.d/$slug.caddy" "reverse_proxy 127.0.0.1:8800" "proxy mode reverse-proxies"
+  local port; port=$(grep -m1 '^PORT=' "$PREVIEW_ETC/instances/$slug.env" | cut -d= -f2)
+  assert_file_contains "$PREVIEW_ETC/sites.d/$slug.caddy" "reverse_proxy 127.0.0.1:$port" "proxy mode reverse-proxies"
   assert_file_not_contains "$PREVIEW_ETC/sites.d/$slug.caddy" "file_server" "proxy mode has no static server"
 }
 

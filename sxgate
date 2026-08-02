@@ -50,6 +50,18 @@ needs_root() {
   exec sudo -E "$0" "$@"
 }
 
+# Idempotently create an unprivileged system user (no home, nologin). Shared by the preview and
+# mail subsystems so neither reimplements useradd (Reuse-before-Build / Keine Redundanz). No-op
+# when not root or when useradd is unavailable; warns — never aborts — on failure.
+ensure_system_user() {
+  local user=$1
+  [ "$(id -u)" -eq 0 ] || return 0
+  command -v useradd >/dev/null 2>&1 || return 0
+  id "$user" >/dev/null 2>&1 && return 0
+  useradd --system --no-create-home --shell /usr/sbin/nologin "$user" 2>/dev/null \
+    || warn "could not create system user '$user'"
+}
+
 # ── conf loading ──────────────────────────────────────────────────────────────
 # The conf is a passive data pool: a plain KEY=value store. We PARSE the whitelisted
 # keys instead of sourcing the file, so the pool holds data and can never execute its
@@ -76,6 +88,28 @@ load_conf() {
     esac
     printf -v "$key" '%s' "$val"               # assign by name; no eval, no exec
   done < "$SXGATE_CONF"
+}
+
+# Single writer for the conf pool — the inverse of load_conf (globals → file). Every conf
+# mutation routes through here, so this entity has exactly one write access point and never
+# parallel writers of the same pool (Zugangspunkt-wiederverwenden / Keine Redundanz).
+save_conf() {
+  atomic_write "$SXGATE_CONF" <<EOF
+# /etc/sxgate/sxgate.conf — managed by sxgate; safe to edit
+TUNNEL_NAME=$TUNNEL_NAME
+MANAGED_ZONE=$MANAGED_ZONE
+CONFIG_FILE=$CONFIG_FILE
+EOF
+}
+
+# Generic passive-pool reader: print the value of KEY from a line-oriented KEY=value file, or
+# nothing (empty + success when the file or key is absent). The pool holds inert data; the
+# interpretation stays here (Passive-Speicher). One reader shared by every KEY=value store —
+# the services table, preview meta, the mail conf — instead of near-identical siblings.
+kv_get() {
+  local file=$1 key=$2
+  [ -s "$file" ] || return 0
+  grep -m1 "^$key=" "$file" 2>/dev/null | cut -d= -f2- || true
 }
 
 # ── locking ───────────────────────────────────────────────────────────────────
@@ -150,9 +184,9 @@ validate_hostname() {
 
 # ── services state file ───────────────────────────────────────────────────────
 svc_get() {
-  # Print URL for service $1, or empty.
-  [ -e "$SERVICES_FILE" ] || return 0
-  awk -F= -v n="$1" '$1==n{ sub(/^[^=]*=/, ""); print; exit }' "$SERVICES_FILE"
+  # Print URL for service $1, or empty. Reuses the shared KEY=value reader (service names are
+  # validated ^[a-z][a-z0-9-]* — no regex metacharacters — so the ^name= match is exact).
+  kv_get "$SERVICES_FILE" "$1"
 }
 
 svc_set() {
@@ -463,12 +497,8 @@ EOF
 _setup_scaffold() {
   local tid=$1 creds=$2 zone=$3
   mkdir -p "$(dirname "$SXGATE_CONF")" "$(dirname "$SERVICES_FILE")" "$BACKUP_DIR" "$(dirname "$CONFIG_FILE")"
-  atomic_write "$SXGATE_CONF" <<EOF
-# /etc/sxgate/sxgate.conf — managed by sxgate; safe to edit
-TUNNEL_NAME=$TUNNEL_NAME
-MANAGED_ZONE=$zone
-CONFIG_FILE=$CONFIG_FILE
-EOF
+  MANAGED_ZONE=$zone
+  save_conf
   [ -e "$SERVICES_FILE" ] || { : > "$SERVICES_FILE"; chmod 0644 "$SERVICES_FILE"; }
   if [ -e "$CONFIG_FILE" ]; then
     backup_config >/dev/null
@@ -502,13 +532,8 @@ cmd_zone() {
 }
 _zone_set_locked() {
   local zone=$1
-  : "${TUNNEL_NAME:=sxgate}" "${CONFIG_FILE:=/etc/cloudflared/config.yml}"
-  atomic_write "$SXGATE_CONF" <<EOF
-# /etc/sxgate/sxgate.conf — managed by sxgate; safe to edit
-TUNNEL_NAME=$TUNNEL_NAME
-MANAGED_ZONE=$zone
-CONFIG_FILE=$CONFIG_FILE
-EOF
+  MANAGED_ZONE=$zone
+  save_conf
   log "zone set: $zone"
 }
 
@@ -572,12 +597,8 @@ EOF
   fi
   # Zone is optional — `sxgate zone <domain>` can set it later; route add enforces it.
 
-  atomic_write "$SXGATE_CONF" <<EOF
-# /etc/sxgate/sxgate.conf — managed by sxgate; safe to edit
-TUNNEL_NAME=$TUNNEL_NAME
-MANAGED_ZONE=$zone
-CONFIG_FILE=$CONFIG_FILE
-EOF
+  MANAGED_ZONE=$zone
+  save_conf
   log "wrote $SXGATE_CONF (zone=$zone)"
 
   [ -e "$SERVICES_FILE" ] || { : > "$SERVICES_FILE"; chmod 0644 "$SERVICES_FILE"; log "created $SERVICES_FILE"; }

@@ -54,11 +54,7 @@ _mail_gen_secret() {
 }
 
 _mail_ensure_user() {
-  [ "$(id -u)" -eq 0 ] || return 0
-  command -v useradd >/dev/null 2>&1 || return 0
-  id "$MAIL_USER" >/dev/null 2>&1 \
-    || useradd --system --no-create-home --shell /usr/sbin/nologin "$MAIL_USER" 2>/dev/null \
-    || warn "could not create system user '$MAIL_USER'"
+  ensure_system_user "$MAIL_USER"   # shared core helper (Reuse-before-Build)
   # Let the egress user read holistic-group secrets (the shared edge secret).
   getent group "$HOLISTIC_GROUP" >/dev/null 2>&1 && usermod -aG "$HOLISTIC_GROUP" "$MAIL_USER" 2>/dev/null || true
 }
@@ -92,7 +88,7 @@ _mail_dkim_pub() {
   grep -v '^-----' "$MAIL_DKIM_DIR/public.pem" | tr -d '\n'
 }
 
-_mail_conf_get() { [ -s "$MAIL_CONF" ] && (grep -m1 "^$1=" "$MAIL_CONF" 2>/dev/null | cut -d= -f2-) || true; }
+_mail_conf_get() { kv_get "$MAIL_CONF" "$1"; }   # shared core KEY=value reader
 
 _mail_write_conf() {
   # _mail_write_conf <domain> <relay-host> <relay-user> <webhook>
