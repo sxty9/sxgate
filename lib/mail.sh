@@ -109,7 +109,6 @@ _mail_webhook_url() {
   local explicit=${1:-}
   [ -n "$explicit" ] && { printf '%s' "$explicit"; return; }
   local origin=""
-  [ -r "$HOLISTIC_DIR/../var/lib/holistic/instance.json" ] && :  # (left for clarity; real path below)
   if [ -r /var/lib/holistic/instance.json ]; then
     origin=$(grep -oE '"origin"[[:space:]]*:[[:space:]]*"[^"]*"' /var/lib/holistic/instance.json 2>/dev/null \
       | sed -E 's/.*"origin"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' | head -n1)
@@ -368,7 +367,7 @@ _mail_cmd_status() {
   echo "── sxgate mail edge ──"
   echo "domain:       $(_mail_conf_get MAIL_DOMAIN || echo '(unset)')"
   echo "webhook:      $(_mail_conf_get WEBHOOK || echo '(unset)')"
-  echo "relay:        $(_mail_conf_get RELAY_HOST || echo '(unset)')${_:+}"
+  echo "relay:        $(_mail_conf_get RELAY_HOST || echo '(unset)')"
   echo "selector:     $MAIL_SELECTOR"
   echo "inbound sec:  $([ -s "$MAIL_INBOUND_SECRET_FILE" ] && echo present || echo MISSING)"
   echo "edge sec:     $([ -s "$MAIL_EDGE_SECRET_FILE" ] && echo present || echo MISSING)"

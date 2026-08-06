@@ -1,10 +1,10 @@
 # Runbook — SSH-Client onboarden (cloudflared evtl. nicht installiert)
 
-**Ziel:** Von einem beliebigen Client per `ssh nanu@ssh.henrysoase.org` auf den Server,
+**Ziel:** Von einem beliebigen Client per `ssh <user>@ssh.example.com` auf den Server,
 **ohne** vorauszusetzen, dass `cloudflared` schon da ist. Am Ende tippst du normales
 `ssh`/`scp`/`rsync`; einmalig wird der Client eingerichtet.
 
-**Warum überhaupt cloudflared am Client?** `ssh.henrysoase.org` zeigt auf Cloudflares
+**Warum überhaupt cloudflared am Client?** `ssh.example.com` zeigt auf Cloudflares
 Edge, die **nur HTTPS** annimmt — es gibt **keinen offenen Port 22**. `cloudflared`
 verpackt die SSH-Session in WebSocket-über-HTTPS (`ProxyCommand`). Ohne diesen lokalen
 Proxy ist der Server über den Tunnel nicht per SSH erreichbar — es führt also kein Weg
@@ -20,9 +20,9 @@ ssh (Client) ─▶ cloudflared access (ProxyCommand) ─▶ Cloudflare-Edge
 ## Vorbedingungen
 | Was | Wo | Prüfen |
 |---|---|---|
-| Server-Tunnel + `ssh`-Route aktiv | Server | `sudo ./sxgate route ls` zeigt `ssh.henrysoase.org → ssh` |
-| DNS zeigt auf den Tunnel | überall | `dig +short ssh.henrysoase.org` → `<id>.cfargotunnel.com` |
-| Dein Public-Key liegt in `~/.ssh/authorized_keys` des Server-Users `nanu` | Server | sonst Schritt 4 |
+| Server-Tunnel + `ssh`-Route aktiv | Server | `sudo ./sxgate route ls` zeigt `ssh.example.com → ssh` |
+| DNS zeigt auf den Tunnel | überall | `dig +short ssh.example.com` → `<id>.cfargotunnel.com` |
+| Dein Public-Key liegt in `~/.ssh/authorized_keys` des Server-Users `<user>` | Server | sonst Schritt 4 |
 | Lokales Keypair am Client | Client | `ls ~/.ssh/id_ed25519` — falls leer: `ssh-keygen -t ed25519` |
 
 ---
@@ -103,7 +103,7 @@ Pfad aus Schritt 2 einsetzen:
 ```bash
 CF=$(command -v cloudflared)
 cat >> ~/.ssh/config <<EOF
-Host ssh.henrysoase.org
+Host ssh.example.com
   ProxyCommand $CF access ssh --hostname %h
 EOF
 chmod 600 ~/.ssh/config
@@ -113,13 +113,13 @@ chmod 600 ~/.ssh/config
 ```powershell
 $cfg = "$env:USERPROFILE\.ssh\config"
 if (!(Test-Path $cfg)) { New-Item -ItemType File -Path $cfg -Force | Out-Null }
-Add-Content $cfg "`nHost ssh.henrysoase.org`n  ProxyCommand C:\Tools\cloudflared.exe access ssh --hostname %h"
+Add-Content $cfg "`nHost ssh.example.com`n  ProxyCommand C:\Tools\cloudflared.exe access ssh --hostname %h"
 ```
 
 **Verify:**
 ```bash
-ssh -G ssh.henrysoase.org | grep -i proxycommand
-# erwartet: proxycommand <pfad>/cloudflared access ssh --hostname ssh.henrysoase.org
+ssh -G ssh.example.com | grep -i proxycommand
+# erwartet: proxycommand <pfad>/cloudflared access ssh --hostname ssh.example.com
 ```
 
 ---
@@ -128,7 +128,7 @@ ssh -G ssh.henrysoase.org | grep -i proxycommand
 Nur wenn dein Key noch nicht in `authorized_keys` des Servers liegt. Geht über denselben
 Tunnel — ist der ProxyCommand (Schritt 3) gesetzt und Passwort-Login am Server noch aktiv:
 ```bash
-ssh-copy-id nanu@ssh.henrysoase.org
+ssh-copy-id <user>@ssh.example.com
 ```
 Kein Passwort-Login mehr aktiv? Dann den Inhalt von `~/.ssh/id_ed25519.pub` auf
 anderem Weg (z.B. lokal am Server) in `~/.ssh/authorized_keys` eintragen.
@@ -138,14 +138,14 @@ anderem Weg (z.B. lokal am Server) in `~/.ssh/authorized_keys` eintragen.
 ## Schritt 5 — Verbinden + verifizieren
 ```bash
 ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=25 \
-    nanu@ssh.henrysoase.org \
+    <user>@ssh.example.com \
     'echo "LOGIN-OK: $(whoami)@$(hostname) — peer ${SSH_CONNECTION%% *}"'
 ```
-**Erwartet:** `LOGIN-OK: nanu@home — peer 127.0.0.1`
+**Erwartet:** `LOGIN-OK: <user>@home — peer 127.0.0.1`
 Das `peer 127.0.0.1` beweist: die Session kam über den lokalen cloudflared-Tunnel
 (localhost:22) am Server an, nicht über einen direkten Port.
 
-Ab jetzt einfach `ssh nanu@ssh.henrysoase.org`. `scp`/`rsync`/`sftp`/VS-Code-Remote-SSH
+Ab jetzt einfach `ssh <user>@ssh.example.com`. `scp`/`rsync`/`sftp`/VS-Code-Remote-SSH
 laufen transparent über denselben Host.
 
 ---
@@ -154,7 +154,7 @@ laufen transparent über denselben Host.
 Wenn du `~/.ssh/config` nicht anfassen willst, den ProxyCommand inline mitgeben:
 ```bash
 ssh -o ProxyCommand="$(command -v cloudflared) access ssh --hostname %h" \
-    nanu@ssh.henrysoase.org
+    <user>@ssh.example.com
 ```
 
 ---
@@ -162,14 +162,14 @@ ssh -o ProxyCommand="$(command -v cloudflared) access ssh --hostname %h" \
 ## Troubleshooting
 | Symptom | Check / Fix |
 |---|---|
-| `ssh: connect ... Connection timed out` | DNS prüfen: `dig +short ssh.henrysoase.org` muss `<id>.cfargotunnel.com` liefern. |
+| `ssh: connect ... Connection timed out` | DNS prüfen: `dig +short ssh.example.com` muss `<id>.cfargotunnel.com` liefern. |
 | `Bad configuration option` | Hinweis-Preamble ist in `~/.ssh/config` gelandet — die `Add to your …`-Zeile entfernen. |
 | `cloudflared: command not found` beim Connect | ProxyCommand nutzt relativen Namen, aber GUI-Client hat anderen `PATH` → absoluten Pfad eintragen (Schritt 2/3). |
-| Proxy isoliert testen | `cloudflared access ssh --hostname ssh.henrysoase.org` (muss „hängen"/lauschen, kein Sofort-Fehler). |
-| Verbose-Login | `ssh -v nanu@ssh.henrysoase.org` |
+| Proxy isoliert testen | `cloudflared access ssh --hostname ssh.example.com` (muss „hängen"/lauschen, kein Sofort-Fehler). |
+| Verbose-Login | `ssh -v <user>@ssh.example.com` |
 
 ## Sicherheitshinweis
-Port 22 ist über `ssh.henrysoase.org` öffentlich erreichbar (nur durch SSH-Auth
+Port 22 ist über `ssh.example.com` öffentlich erreichbar (nur durch SSH-Auth
 geschützt). Empfehlung am Server: `PasswordAuthentication no` (erst Key testen!),
 optional Cloudflare Access (Zero Trust) als vorgelagertes Identitäts-Gate. Siehe
 README → „SSH über den Tunnel" und [ssh-loopback-selftest.md](ssh-loopback-selftest.md).

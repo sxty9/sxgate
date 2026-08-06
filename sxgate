@@ -490,7 +490,7 @@ EOF
 
   log ""
   log "sxgate is up. Next:"
-  log "  sxgate zone <domain>            # e.g. henrysoase.org"
+  log "  sxgate zone <domain>            # the DNS zone this host serves"
   log "  sxgate service add <name> <url>"
   log "  sxgate route add <host> <name>"
 }
@@ -512,6 +512,78 @@ ingress:
 EOF
     log "scaffolded $CONFIG_FILE"
   fi
+}
+
+# ── provision (sxgate provision) — the ONE uniform host bring-up ────────────────
+# Every environment runs the SAME sxgate and stands up the SAME five responsibilities;
+# the only per-host difference is runtime configuration (zone, tunnel, smarthost creds).
+# `provision` is that single command: from named runtime values it installs ALL five
+# subsystems on THIS host, in order, halting on the first failure. There is deliberately
+# no "here only mail, there everything" switch — a host is provisioned or it is not.
+# Every step is idempotent, so re-running provision on an already-configured host is safe.
+cmd_provision() {
+  local zone="" tunnel="$TUNNEL_NAME" relay="" relay_user="" mail_domain=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --zone) zone=$2; shift 2 ;;
+      --tunnel) tunnel=$2; shift 2 ;;
+      --mail-relay) relay=$2; shift 2 ;;
+      --mail-relay-user) relay_user=$2; shift 2 ;;
+      --mail-domain) mail_domain=$2; shift 2 ;;
+      --yes|-y) SXGATE_YES=1; shift ;;
+      -h|--help) cat <<EOF; return 0 ;;
+Usage: sxgate provision --zone <domain> [--tunnel <name>]
+                        [--mail-domain <d>] [--mail-relay <host:port>] [--mail-relay-user <u>]
+
+Bring THIS host fully up in one pass — the SAME command on every host; only the runtime
+values differ. Installs and wires ALL FIVE sxgate responsibilities for this host's own zone:
+  1. tunnel + routes        (cloudflared: setup, then the managed zone)
+  2. SSH over the tunnel     (a service; no separate step — add it with 'service add ssh …')
+  3. mail egress             (DKIM-signing relay unit)
+  4. mail inbound            (Email Worker scaffold + maild drop-in)
+  5. preview sandboxes       (wildcard ingress + dispatcher + instance template)
+
+Secrets (DKIM key, edge/inbound secrets, tunnel credentials) are generated HERE, on this
+host, and never travel between hosts. A fresh host needs only the values above.
+
+The one interactive step is the Cloudflare login during 'setup' (a browser URL is printed);
+on a host that already holds a cloudflared cert it is skipped.
+EOF
+      *) die "unknown flag: $1" 2 ;;
+    esac
+  done
+  [ -n "$zone" ] || die "provision needs --zone <domain>" 2
+  command -v cmd_mail    >/dev/null 2>&1 || die "mail edge not installed (lib/mail.sh missing)" 5
+  command -v cmd_preview >/dev/null 2>&1 || die "preview engine not installed (lib/preview.sh missing)" 5
+  needs_root "provision" "--zone" "$zone" \
+    "${tunnel:+--tunnel}" "${tunnel:+$tunnel}" \
+    "${mail_domain:+--mail-domain}" "${mail_domain:+$mail_domain}" \
+    "${relay:+--mail-relay}" "${relay:+$relay}" \
+    "${relay_user:+--mail-relay-user}" "${relay_user:+$relay_user}" \
+    $([ "$SXGATE_YES" = 1 ] && printf -- '--yes')
+  TUNNEL_NAME=$tunnel
+
+  log "── sxgate provision: bringing this host up under zone '$zone' ──"
+  log ""
+  log "[1/4] tunnel + cloudflared"
+  cmd_setup --tunnel "$tunnel"
+  cmd_zone "$zone"
+  log ""
+  log "[2/4] mail edge (egress + inbound scaffold)"
+  local mailargs=(setup)
+  [ -n "$mail_domain" ] && mailargs+=(--domain "$mail_domain")
+  [ -n "$relay" ]       && mailargs+=(--relay "$relay")
+  [ -n "$relay_user" ]  && mailargs+=(--relay-user "$relay_user")
+  cmd_mail "${mailargs[@]}"
+  log ""
+  log "[3/4] preview sandboxes"
+  cmd_preview setup
+  log ""
+  log "[4/4] done — this host now serves its own zone '$zone'."
+  log "Add services + routes for this host, e.g.:"
+  log "  sxgate service add holistic http://localhost:21487"
+  log "  sxgate route   add holistic.$zone holistic"
+  log "See 'sxgate status' for the live state."
 }
 
 cmd_zone() {
@@ -995,6 +1067,7 @@ cmd_help() {
 sxgate $SXGATE_VERSION — manage subdomain↔service routing for a Cloudflare Tunnel.
 
 Usage:
+  sxgate provision --zone <domain> [...] bring THIS host fully up (all five) — one command per host
   sxgate setup [--tunnel <name>]        install cloudflared + tunnel + service (turnkey)
   sxgate zone [<domain>]                set or show the managed DNS zone
   sxgate service add <name> <url>
@@ -1013,11 +1086,10 @@ Usage:
   sxgate init [--zone <domain>] [--tunnel <name>] [--config <path>]   # low-level scaffold
   sxgate --version | --help
 
-Quickstart:
-  sudo ./sxgate setup
-  sudo ./sxgate zone henrysoase.org
+Quickstart (any host — only the runtime values differ):
+  sudo ./sxgate provision --zone <domain>
   sudo ./sxgate service add holistic http://localhost:21487
-  sudo ./sxgate route add holistic.henrysoase.org holistic
+  sudo ./sxgate route add holistic.<domain> holistic
 
 Env:
   SXGATE_YES=1     skip confirmations
@@ -1041,6 +1113,7 @@ main() {
   shift || true
   case "$cmd" in
     setup)       cmd_setup "$@" ;;
+    provision)   cmd_provision "$@" ;;
     zone)        cmd_zone "$@" ;;
     init)        cmd_init "$@" ;;
     service)     cmd_service "$@" ;;
