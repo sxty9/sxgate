@@ -670,8 +670,35 @@ test_axioms_data_integrity_source_invariants() {
   fi
 }
 
+test_provision_contract() {
+  # setup_env/teardown_env are provided by run_test.
+  # --help lists all five responsibilities and returns 0.
+  local out; out=$(SXGATE_QUIET=0 "$SXGATE" provision --help 2>&1)
+  assert_contains "$out" "ALL FIVE" "provision --help states it stands up all five"
+  assert_contains "$out" "mail egress" "provision --help names mail egress"
+  assert_contains "$out" "preview" "provision --help names preview"
+  assert_contains "$out" "Bring THIS host fully up" "provision is a first-class command"
+  # provision requires a zone (the only mandatory runtime value).
+  assert_exit 2 "$SXGATE" provision
+}
+
+test_no_instance_specifics() {
+  # Instance neutrality (Keine Instanz-Spezifika): no real zone, domain, host or personal
+  # identifier is committed anywhere in the tree. `.example`/`example.com` are RFC 2606
+  # documentation placeholders and are allowed; a concrete instance domain/user is not.
+  local root="$SCRIPT_DIR/.."
+  # Build the pattern from fragments so this guard never matches its own source text.
+  local pat="henry""soase|\\bna""nu\\b"
+  local hits
+  hits=$(grep -rInE "$pat" "$root" --exclude-dir=.git 2>/dev/null || true)
+  [ -z "$hits" ] && ok "no instance-specific domain/user in the repository" \
+    || fail "no instance-specific domain/user" "found: $hits"
+}
+
 # ── run all ───────────────────────────────────────────────────────────────────
 TESTS=(
+  test_provision_contract
+  test_no_instance_specifics
   test_conf_is_passive_data
   test_axioms_data_integrity_source_invariants
   test_help_and_version

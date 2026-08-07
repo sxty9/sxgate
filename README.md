@@ -1,40 +1,52 @@
 # sxgate
 
-Schlanker "Linker" zwischen einer Cloudflare-Domain und einem Webservice der zuhause auf einem Ubuntu-Server (24/7) läuft. Verbindung via **Cloudflare Tunnel** (`cloudflared`) — keine offenen Router-Ports, dynamische IP / CGNAT egal, HTTPS + DDoS-Schutz inklusive, gratis.
+The network edge of ONE environment: the "linker" between a Cloudflare zone and the services
+running on **this** host. Traffic rides a **Cloudflare Tunnel** (`cloudflared`) — no open router
+ports, dynamic IP / CGNAT irrelevant, HTTPS + DDoS protection included.
 
 ```
- Browser ──HTTPS──▶ Cloudflare-Edge ──Tunnel──▶ cloudflared (Server) ──HTTP──▶ Webservice (z.B. localhost:8080)
+ Browser ──HTTPS──▶ Cloudflare-Edge ──Tunnel──▶ cloudflared (this host) ──HTTP──▶ service (e.g. localhost:8080)
 ```
 
-Dieses Repo enthält bewusst **keinen Webservice-Code** — nur die Tunnel-Config, Doku und das Runbook. Der eigentliche Service wird separat deployed.
+## Leitbild — one sxgate per environment
 
-## Status
-- [x] Phase A — Repo-Scaffold (Configs als Platzhalter)
-- [x] Domain: **henrysoase.org** (bei Cloudflare registriert, Zone aktiv)
-- [x] CLI: `sxgate` für Subdomain↔Service-Verwaltung (siehe [docs/cli.md](docs/cli.md))
-- [ ] Phase B — Tunnel auf Server eingerichtet + DNS-Record gesetzt
-- [ ] Phase C — Webservice auf Server läuft + Tunnel zeigt auf den Port
+1. **Every** environment has an sxgate.
+2. Each sxgate manages **everything** of its own environment — routes, mail egress, mail
+   inbound, preview sandboxes.
+3. Each sxgate manages **nothing** of an environment it does not belong to: no foreign zone, no
+   foreign credentials, no foreign routes, no remote control of another host.
 
-## Phase B — Tunnel aufsetzen (ein Befehl)
-Repo klonen und `setup` laufen lassen — repo-lokal wie `./holistic`, **kein separates `install.sh`**:
+There is no "production" special case and no environment detection: the SAME program with the
+SAME commands runs on every host. The ONLY difference between two hosts is their runtime
+configuration — which zone, which tunnel, which credentials. Those values live in the runtime
+config and never in this repository. Full model + the operator's one-time step:
+[docs/deployment.md](docs/deployment.md).
+
+## Bring a host up — one command
+
+Clone the repo on the host, then provision it from that host's own runtime values:
 
 ```bash
-git clone https://github.com/sxty9/sxgate.git ~/sxgate && cd ~/sxgate
-sudo ./sxgate setup                  # installiert cloudflared, Cloudflare-Login (Browser-URL),
-                                     # legt den Tunnel an, scaffoldet config.yml + systemd-Service
-sudo ./sxgate zone henrysoase.org    # die verwaltete DNS-Zone (entkoppelt von setup)
+git clone <sxgate-repo-url> ~/sxgate && cd ~/sxgate
+sudo ./sxgate provision --zone <domain>          # stands up ALL five responsibilities for THIS host
 ```
 
-`setup` ist idempotent — vorhandenes cloudflared / Tunnel / systemd-Service werden erkannt und übersprungen. Der einzige interaktive Schritt ist der `cloudflared tunnel login` (Browser-URL); bei vorhandenem `cert.pem` entfällt er.
+`provision` installs and wires cloudflared + tunnel + routes, the mail egress relay, the mail
+inbound scaffold, and the preview subsystem — for this host's own zone. Every step is idempotent,
+so re-running it is safe. The one interactive step is the Cloudflare login during `setup` (a
+browser URL is printed); on a host that already holds a cloudflared cert it is skipped.
 
-**Wichtig:** Die `~/.cloudflared/<TUNNEL-ID>.json` enthält Credentials — **niemals committen**. `.gitignore` deckt das ab.
+Secrets (DKIM key, edge/inbound secrets, tunnel credentials) are generated **on this host** and
+never travel between hosts. A fresh host needs only the values above.
 
-## Phase C — Webservice anbinden
-Mit dem `sxgate` CLI:
+**Wichtig:** `~/.cloudflared/<TUNNEL-ID>.json` holds credentials — **never commit it**. `.gitignore`
+covers it.
+
+## Attach a service
 
 ```bash
 sudo ./sxgate service add blog http://localhost:2368
-sudo ./sxgate route   add blog.henrysoase.org blog
+sudo ./sxgate route   add blog.<domain> blog
 sudo ./sxgate route   ls
 ```
 
@@ -46,17 +58,17 @@ Server-SSH über eine Subdomain (Standard `ssh.<domain>`) erreichbar machen — 
 
 ```bash
 sudo ./sxgate service add ssh ssh://localhost:22
-sudo ./sxgate route   add ssh.henrysoase.org ssh
+sudo ./sxgate route   add ssh.example.com ssh
 ```
 
-**Verbinden:** *Nicht* direkt per `ssh ssh.henrysoase.org` — der Tunnel spricht am Cloudflare-Edge nur HTTPS (kein offener Port 22). Der Client braucht einmalig `cloudflared` + einen ProxyCommand; danach ist der Alltag normales `ssh`:
+**Verbinden:** *Nicht* direkt per `ssh ssh.example.com` — der Tunnel spricht am Cloudflare-Edge nur HTTPS (kein offener Port 22). Der Client braucht einmalig `cloudflared` + einen ProxyCommand; danach ist der Alltag normales `ssh`:
 
 ```bash
 # am Client, einmalig (cloudflared muss installiert sein):
-cloudflared access ssh-config --hostname ssh.henrysoase.org \
+cloudflared access ssh-config --hostname ssh.example.com \
   | sed -n '/^Host /,$p' >> ~/.ssh/config   # Helper druckt eine Hinweiszeile mit → strippen
 # danach wie gewohnt:
-ssh <user>@ssh.henrysoase.org
+ssh <user>@ssh.example.com
 ```
 
 **Sicherheit — Key-only erzwingen:** Port 22 ist damit übers Internet erreichbar (nur durch SSH-Auth geschützt). Dringend empfohlen: ausschließlich Key-Auth. Auf dem Server:
@@ -81,9 +93,9 @@ sudo sshd -t && sudo systemctl restart ssh.socket
 
 ```bash
 sudo ./sxgate setup                          # einmalig: cloudflared + Tunnel + systemd-Service
-sudo ./sxgate zone henrysoase.org            # verwaltete DNS-Zone
+sudo ./sxgate zone example.com            # verwaltete DNS-Zone
 sudo ./sxgate service add blog http://localhost:2368
-sudo ./sxgate route   add blog.henrysoase.org blog
+sudo ./sxgate route   add blog.example.com blog
 sudo ./sxgate route   ls
 sudo ./sxgate status
 sudo ./sxgate teardown --dry-run             # Umkehrung von setup: zeigt, was entfernt/behalten wird
@@ -105,7 +117,7 @@ Kollidieren paralleler Branches im selben Repo/Deploy:
 ```bash
 sudo ./sxgate preview setup          # einmalig: Wildcard-Ingress *.zone → Dispatcher (+ DNS-Hinweis)
 sudo ./sxgate preview up <branch>    # aus einem Repo mit .sxgate/preview.conf
-#  → https://<branch>-<service>.henrysoase.org
+#  → https://<branch>-<service>.example.com
 sudo ./sxgate preview ls | rebuild <x> | down <x>
 ```
 
@@ -126,11 +138,11 @@ interne Mail direkt zu; **sxgate besitzt die Netzwerkkante**:
 - **DNS:** MX (via Email Routing), SPF, DKIM, DMARC.
 
 ```bash
-sudo ./sxgate mail setup --domain henrysoase.org              # Secrets, DKIM, Egress-Relay,
+sudo ./sxgate mail setup --domain example.com              # Secrets, DKIM, Egress-Relay,
                                                               # maild-Drop-in, Email-Worker + DNS-Records
 sudo ./sxgate mail relay set smtp.provider.com:587 --user me  # Smarthost für den Ausgang
 sudo ./sxgate mail dkim-record                                # DKIM-TXT-Record fürs DNS
-sudo ./sxgate mail test-inbound --to user@henrysoase.org      # Eingangs-Kontrakt gegen maild prüfen
+sudo ./sxgate mail test-inbound --to user@example.com      # Eingangs-Kontrakt gegen maild prüfen
 sudo ./sxgate mail status
 ```
 

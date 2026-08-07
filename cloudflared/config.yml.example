@@ -13,16 +13,16 @@ credentials-file: /root/.cloudflared/<TUNNEL_ID>.json
 # Reihenfolge ist wichtig — erste passende Regel gewinnt. Letzter Eintrag MUSS `service: http_status:404` sein (Catch-all).
 ingress:
   # Beispiel 1: Hauptdomain → Webservice auf Port 8080
-  - hostname: henrysoase.org
+  - hostname: example.com
     service: http://localhost:8080
 
   # Beispiel 2: Subdomain für ein anderes Tool (auskommentieren wenn nicht gebraucht)
-  # - hostname: api.henrysoase.org
+  # - hostname: api.example.com
   #   service: http://localhost:3000
 
   # Beispiel 3: SSH über den Tunnel (Subdomain ssh.<domain> → lokaler sshd auf Port 22)
   # Client verbindet via `cloudflared access ssh` — siehe docs/cli.md.
-  # - hostname: ssh.henrysoase.org
+  # - hostname: ssh.example.com
   #   service: ssh://localhost:22
 
   # Pflicht: Catch-all am Ende

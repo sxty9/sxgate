@@ -5,20 +5,33 @@ Verwaltung von Subdomain↔Service-Routing für einen Cloudflare Tunnel auf eine
 ## Mental Model
 
 - **Services** sind benannte Targets (z.B. `blog` → `http://localhost:2368`). Gespeichert in `/etc/sxgate/services`.
-- **Routes** sind Hostname→Service-Bindings (z.B. `blog.henrysoase.org` → `blog`). Diese landen direkt im `ingress:` Block von `/etc/cloudflared/config.yml` (mit aufgelöster URL).
+- **Routes** sind Hostname→Service-Bindings (z.B. `blog.example.com` → `blog`). Diese landen direkt im `ingress:` Block von `/etc/cloudflared/config.yml` (mit aufgelöster URL).
 - `/etc/cloudflared/config.yml` ist die **Source of Truth** für aktives Routing — `sxgate` editiert sie direkt (atomisch, mit Backup).
 
 ## Installation
 
+Jede Umgebung betreibt ihr eigenes sxgate — dasselbe Programm, dieselben Befehle, nur die
+Laufzeit-Werte unterscheiden sich. Ein Host wird mit **einem** Befehl vollständig hochgezogen:
+
 ```bash
-git clone https://github.com/sxty9/sxgate.git && cd sxgate
-sudo ./sxgate setup                  # installiert cloudflared, Tunnel, systemd-Service
-sudo ./sxgate zone henrysoase.org    # verwaltete DNS-Zone (entkoppelt)
+git clone <sxgate-repo-url> && cd sxgate
+sudo ./sxgate provision --zone <domain>   # richtet ALLE fünf Zuständigkeiten für DIESEN Host ein
 ```
 
-Repo-lokal wie `./holistic` — **kein separates Install-Skript**. `setup` bootstrappt alles inkl. `cloudflared`; `zone` legt die DNS-Zone fest.
+Repo-lokal wie `./holistic` — **kein separates Install-Skript**. Modell + einmaliger
+Betreiber-Schritt: [deployment.md](deployment.md).
 
 ## Befehle
+
+### `sxgate provision --zone <domain> [--tunnel <name>] [--mail-domain <d>] [--mail-relay <host:port>] [--mail-relay-user <u>]`
+
+Der EINE Zugang zum Hochziehen eines Hosts. Führt idempotent und in Reihenfolge (Abbruch beim
+ersten Fehler) die Teil-Bootstraps aus, die man sonst einzeln liefe: `setup` (cloudflared + Tunnel
++ Config) → `zone` → `mail setup` → `preview setup`. Es gibt keinen Schalter „hier nur Mail, dort
+alles": ein Host ist provisioniert oder nicht. Kein zweites Werkzeug — ein Unterbefehl derselben
+CLI, der die bestehenden Teil-Befehle unverändert wiederverwendet. Einziger interaktiver Moment:
+der Cloudflare-Login in `setup` (bei vorhandenem `cert.pem` übersprungen). Geheimnisse (DKIM,
+Edge-/Inbound-Secrets, Tunnel-Credentials) entstehen auf DIESEM Host und reisen nie zwischen Hosts.
 
 ### `sxgate setup [--tunnel <name>]`
 
@@ -26,7 +39,7 @@ Turnkey-Bootstrap (als root), idempotent: installiert `cloudflared` (offizielles
 
 ### `sxgate zone [<domain>]`
 
-Setzt (`sxgate zone henrysoase.org`) oder zeigt (`sxgate zone`) die verwaltete DNS-Zone in `/etc/sxgate/sxgate.conf`. `route add` validiert Hostnamen gegen diese Zone und verlangt sie.
+Setzt (`sxgate zone example.com`) oder zeigt (`sxgate zone`) die verwaltete DNS-Zone in `/etc/sxgate/sxgate.conf`. `route add` validiert Hostnamen gegen diese Zone und verlangt sie.
 
 ### `sxgate init [--zone <domain>] [--tunnel <name>] [--config <path>]`
 
@@ -61,7 +74,7 @@ Hot Path. Macht in dieser Reihenfolge:
 6. `systemctl reload cloudflared` (Fallback: `restart`)
 
 ```bash
-sudo sxgate route add blog.henrysoase.org blog
+sudo sxgate route add blog.example.com blog
 ```
 
 Idempotent: Re-Run mit gleichem Service ist No-Op; Re-Run mit anderem Service updated.
@@ -106,8 +119,8 @@ eigenen URL, ohne dass parallele Branches im selben Repo/Deploy kollidieren. Sch
 gratis, vom bestehenden `*.<zone>`-Universal-Cert abgedeckt):
 
 ```
-prod:    <service>.henrysoase.org
-sandbox: <branch>-<service>.henrysoase.org      # z.B. feat-profile-holistic.henrysoase.org
+prod:    <service>.example.com
+sandbox: <branch>-<service>.example.com      # z.B. feat-profile-holistic.example.com
 ```
 
 Der Tunnel wird **einmalig** angefasst (eine Wildcard-Ingress `*.<zone>` → ein lokaler
@@ -151,14 +164,14 @@ SSH ist nur ein Service mit `ssh://`-Schema — **kein** Sonderbefehl nötig. St
 
 ```bash
 sudo ./sxgate service add ssh ssh://localhost:22
-sudo ./sxgate route   add ssh.henrysoase.org ssh
+sudo ./sxgate route   add ssh.example.com ssh
 ```
 
-Damit ist der lokale sshd (Port 22) als `ssh.henrysoase.org` über den Tunnel erreichbar. Andere Subdomain/Port: einfach `service add`-URL bzw. `route add`-Hostname anpassen (z.B. `service add ssh ssh://localhost:2222`, `route add admin.henrysoase.org ssh`).
+Damit ist der lokale sshd (Port 22) als `ssh.example.com` über den Tunnel erreichbar. Andere Subdomain/Port: einfach `service add`-URL bzw. `route add`-Hostname anpassen (z.B. `service add ssh ssh://localhost:2222`, `route add admin.example.com ssh`).
 
 ### Verbinden (Client)
 
-**Wichtig:** Man kann sich **nicht** direkt mit `ssh ssh.henrysoase.org` verbinden. Der Tunnel ist ein ausgehender HTTPS-Tunnel; `ssh.<zone>` zeigt auf Cloudflares Edge, die **nur HTTPS** annimmt — es gibt **keinen offenen Port 22**. Der Client wickelt SSH daher per `cloudflared` in WebSocket-über-HTTPS. Nach einmaliger Einrichtung tippst du trotzdem nur `ssh user@host`.
+**Wichtig:** Man kann sich **nicht** direkt mit `ssh ssh.example.com` verbinden. Der Tunnel ist ein ausgehender HTTPS-Tunnel; `ssh.<zone>` zeigt auf Cloudflares Edge, die **nur HTTPS** annimmt — es gibt **keinen offenen Port 22**. Der Client wickelt SSH daher per `cloudflared` in WebSocket-über-HTTPS. Nach einmaliger Einrichtung tippst du trotzdem nur `ssh user@host`.
 
 1. `cloudflared` am Client installieren:
    - macOS: `brew install cloudflared`
@@ -166,16 +179,16 @@ Damit ist der lokale sshd (Port 22) als `ssh.henrysoase.org` über den Tunnel er
    - Linux: Binary aus den GitHub-Releases nach `/usr/local/bin/cloudflared` + `chmod +x`
 2. Einmalig den ProxyCommand in `~/.ssh/config` eintragen — am einfachsten generiert:
    ```bash
-   cloudflared access ssh-config --hostname ssh.henrysoase.org >> ~/.ssh/config
+   cloudflared access ssh-config --hostname ssh.example.com >> ~/.ssh/config
    ```
    Ergebnis:
    ```
-   Host ssh.henrysoase.org
+   Host ssh.example.com
      ProxyCommand cloudflared access ssh --hostname %h
    ```
-3. Verbinden: `ssh <user>@ssh.henrysoase.org` (Host-Key beim ersten Mal bestätigen). `scp`/`rsync`/`sftp`/`ssh-copy-id`/VS-Code-Remote-SSH laufen transparent über denselben Host.
+3. Verbinden: `ssh <user>@ssh.example.com` (Host-Key beim ersten Mal bestätigen). `scp`/`rsync`/`sftp`/`ssh-copy-id`/VS-Code-Remote-SSH laufen transparent über denselben Host.
 
-Troubleshooting: `dig +short ssh.henrysoase.org` → CNAME auf `<tunnel-id>.cfargotunnel.com`; Proxy isoliert testen mit `cloudflared access ssh --hostname ssh.henrysoase.org`; `ssh -v <user>@ssh.henrysoase.org` für Verbose-Logs.
+Troubleshooting: `dig +short ssh.example.com` → CNAME auf `<tunnel-id>.cfargotunnel.com`; Proxy isoliert testen mit `cloudflared access ssh --hostname ssh.example.com`; `ssh -v <user>@ssh.example.com` für Verbose-Logs.
 
 ### Sicherheit
 
